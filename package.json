@@ -1,6 +1,6 @@
 {
   "name": "agent-crawl",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "High-performance, lightweight TypeScript web scraping library for LLM Agents.",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -40,12 +40,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/silupanda/cassini.git"
+    "url": "https://github.com/silupanda/agent-crawl.git"
   },
   "bugs": {
-    "url": "https://github.com/silupanda/cassini/issues"
+    "url": "https://github.com/silupanda/agent-crawl/issues"
   },
-  "homepage": "https://github.com/silupanda/cassini#readme",
+  "homepage": "https://github.com/silupanda/agent-crawl#readme",
   "engines": {
     "node": ">=18.0.0"
   },
