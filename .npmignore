@@ -1,0 +1,10 @@
+src/
+test/
+.git/
+.github/
+.gitignore
+tsconfig.json
+tsup.config.ts
+task.md
+implementation_plan.md
+walkthrough.md
