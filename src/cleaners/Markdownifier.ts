@@ -1,4 +1,5 @@
 import TurndownService from 'turndown';
+import { gfm } from 'turndown-plugin-gfm';
 import * as cheerio from 'cheerio';
 
 export interface MarkdownifierOptions {
@@ -24,6 +25,9 @@ export class Markdownifier {
             codeBlockStyle: 'fenced',
             headingStyle: 'atx',
         });
+
+        // Enable GFM tables, strikethrough, and task lists
+        this.turndownService.use(gfm);
 
         // Custom rule to strip decorative links but keep semantic ones
         this.turndownService.addRule('semanticLinks', {

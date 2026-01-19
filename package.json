@@ -63,6 +63,7 @@
   },
   "dependencies": {
     "playwright-core": "^1.57.0",
+    "turndown-plugin-gfm": "^1.0.2",
     "zod-to-json-schema": "^3.25.1"
   },
   "peerDependencies": {
