@@ -88,6 +88,8 @@ export class BrowserManager {
 
             await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
+            // Try to dismiss cookie consent banners
+            await this.dismissCookieBanners(page);
 
             if (waitForSelector) {
                 await page.waitForSelector(waitForSelector, { timeout: 10000 });
@@ -126,6 +128,52 @@ export class BrowserManager {
             console.log('[BrowserManager] Closing browser instance (idle).');
             await this.browser.close();
             this.browser = null;
+        }
+    }
+
+    /**
+     * Attempt to dismiss cookie consent banners by clicking common accept buttons.
+     * Fails silently if no banner is found.
+     */
+    private async dismissCookieBanners(page: Page): Promise<void> {
+        const acceptSelectors = [
+            // Common accept button patterns
+            'button[id*="accept"]',
+            'button[class*="accept"]',
+            'button[id*="agree"]',
+            'button[class*="agree"]',
+            'button[id*="consent"]',
+            'button[class*="consent"]',
+            // Popular cookie consent libraries
+            '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',  // Cookiebot
+            '#onetrust-accept-btn-handler',  // OneTrust
+            '.cc-accept-all',  // CookieConsent
+            '.cc-allow',
+            '[data-cookiefirst-action="accept"]',  // CookieFirst
+            '#accept-cookies',
+            '.cookie-accept',
+            // Generic patterns
+            'button:has-text("Accept")',
+            'button:has-text("Accept All")',
+            'button:has-text("Allow")',
+            'button:has-text("Allow All")',
+            'button:has-text("I agree")',
+            'button:has-text("Got it")',
+            'button:has-text("OK")',
+        ];
+
+        for (const selector of acceptSelectors) {
+            try {
+                const button = await page.$(selector);
+                if (button && await button.isVisible()) {
+                    await button.click();
+                    // Wait briefly for banner to disappear
+                    await page.waitForTimeout(300);
+                    return;
+                }
+            } catch {
+                // Selector not found or click failed, continue to next
+            }
         }
     }
 }

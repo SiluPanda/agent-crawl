@@ -164,6 +164,12 @@ export class Markdownifier {
         $('header').remove();
         $('.advertisement, .ad, [class*="social"]').remove();
 
+        // Remove cookie consent banners and GDPR notices
+        $('[class*="cookie"], [id*="cookie"], [class*="consent"], [id*="consent"]').remove();
+        $('[class*="gdpr"], [id*="gdpr"], [class*="privacy-banner"], [id*="privacy-banner"]').remove();
+        $('.cc-banner, .cc-window, #CybotCookiebotDialog, #onetrust-consent-sdk').remove();
+        $('[aria-label*="cookie"], [aria-label*="consent"]').remove();
+
         // Extract main content if requested
         if (options.extractMainContent) {
             const mainContent = this.extractMainContent($.html());
@@ -257,6 +263,12 @@ export class Markdownifier {
         $('[style*="display: none"], [style*="visibility: hidden"]').remove();
         $('nav, footer, header').remove();
         $('.advertisement, .ad, [class*="social"]').remove();
+
+        // Remove cookie consent banners and GDPR notices
+        $('[class*="cookie"], [id*="cookie"], [class*="consent"], [id*="consent"]').remove();
+        $('[class*="gdpr"], [id*="gdpr"], [class*="privacy-banner"], [id*="privacy-banner"]').remove();
+        $('.cc-banner, .cc-window, #CybotCookiebotDialog, #onetrust-consent-sdk').remove();
+        $('[aria-label*="cookie"], [aria-label*="consent"]').remove();
 
         let cleanedHtml: string;
         if (options.extractMainContent) {
