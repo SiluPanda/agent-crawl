@@ -10,12 +10,14 @@ export const asVercelTool = () => {
     return {
         description: 'A web scraper that can fetch content from URLs and return optimized markdown. Automatically uses browser rendering for dynamic content.',
         parameters: ScrapeOptionsSchema,
-        execute: async ({ url, mode, waitFor, extractMainContent, optimizeTokens }: z.infer<typeof ScrapeOptionsSchema>) => {
+        execute: async ({ url, mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel }: z.infer<typeof ScrapeOptionsSchema>) => {
             const page = await AgentCrawl.scrape(url, {
                 mode,
                 waitFor,
                 extractMainContent,
                 optimizeTokens,
+                stealth,
+                stealthLevel,
             });
             return {
                 content: page.content,
@@ -41,6 +43,8 @@ export const asVercelCrawlTool = () => {
             waitFor, 
             extractMainContent, 
             optimizeTokens,
+            stealth,
+            stealthLevel,
             maxDepth,
             maxPages,
             concurrency 
@@ -50,6 +54,8 @@ export const asVercelCrawlTool = () => {
                 waitFor,
                 extractMainContent,
                 optimizeTokens,
+                stealth,
+                stealthLevel,
                 maxDepth,
                 maxPages,
                 concurrency,

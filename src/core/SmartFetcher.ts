@@ -30,7 +30,7 @@ export class SmartFetcher {
      */
     private requiresJavaScript(html: string, headers: Headers): boolean {
         const lowerHtml = html.toLowerCase();
-        
+
         // Extract text content once for reuse (strip all HTML tags)
         const textContent = html.replace(/<[^>]*>/g, '').trim();
 
@@ -70,15 +70,27 @@ export class SmartFetcher {
         return false;
     }
 
+    private getErrorMessage(error: unknown): string {
+        if (error instanceof Error) {
+            if (error.name === 'AbortError') {
+                return 'Request timed out';
+            }
+            return error.message;
+        }
+        return 'Unknown fetch error';
+    }
+
+    private async wait(ms: number): Promise<void> {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
     async fetch(url: string, options: FetchOptions = {}): Promise<FetchResult> {
         const { retries = 2, timeout = 10000 } = options;
-        let attempt = 0;
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-        while (attempt <= retries) {
             try {
-                const controller = new AbortController();
-                const id = setTimeout(() => controller.abort(), timeout);
-
                 const response = await fetch(url, {
                     method: options.method || 'GET',
                     headers: {
@@ -91,50 +103,53 @@ export class SmartFetcher {
                     signal: controller.signal,
                 });
 
-                clearTimeout(id);
+                const headers = Object.fromEntries(response.headers.entries());
 
-                // Auth required
-                if (response.status === 403 || response.status === 401) {
+                if (!response.ok) {
+                    const isRetryable = response.status >= 500 || response.status === 408 || response.status === 429;
+                    if (isRetryable && attempt < retries) {
+                        await this.wait(1000 * (attempt + 1));
+                        continue;
+                    }
+
                     return {
                         url,
                         html: '',
                         status: response.status,
-                        headers: Object.fromEntries(response.headers.entries()),
+                        headers,
                         isStaticSuccess: false,
+                        needsBrowser: false,
+                        error: `HTTP ${response.status}`,
                     };
                 }
 
-                // Server error - retry
-                if (!response.ok && response.status >= 500) {
-                    throw new Error(`Server error: ${response.status}`);
-                }
-
                 const html = await response.text();
-
-                // Intelligent JS detection
                 const needsJS = this.requiresJavaScript(html, response.headers);
 
                 return {
                     url,
                     html,
                     status: response.status,
-                    headers: Object.fromEntries(response.headers.entries()),
+                    headers,
                     isStaticSuccess: !needsJS,
+                    needsBrowser: needsJS,
+                    error: needsJS ? 'Detected client-side rendered content' : undefined,
                 };
-
             } catch (error) {
-                attempt++;
-                if (attempt > retries) {
+                if (attempt >= retries) {
                     return {
                         url,
                         html: '',
                         status: 0,
                         headers: {},
                         isStaticSuccess: false,
+                        needsBrowser: false,
+                        error: this.getErrorMessage(error),
                     };
                 }
-                // Exponential backoff
-                await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+                await this.wait(1000 * (attempt + 1));
+            } finally {
+                clearTimeout(timeoutId);
             }
         }
 
@@ -143,7 +158,9 @@ export class SmartFetcher {
             html: '',
             status: 0,
             headers: {},
-            isStaticSuccess: false
+            isStaticSuccess: false,
+            needsBrowser: false,
+            error: 'Unknown fetch error',
         };
     }
 }

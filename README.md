@@ -13,6 +13,8 @@ It features a **Hybrid Engine** that starts with extremely fast static scraping 
 - 🧠 **Agent-First**: Detects Main Content, removes boilerplate, and extracts semantic structure.
 - 🔌 **Plug-and-Play**: Native adapters for **Vercel AI SDK** and **OpenAI Agents SDK**.
 - 🛡️ **Production Ready**: Built-in caching, retry logic, user-agent rotation, and resource blocking.
+- 🕵️ **Stealth Mode**: Optional best-effort browser hardening to reduce common bot-detection fingerprints.
+- ✅ **Predictable Errors**: Non-2xx HTTP responses are surfaced as errors instead of silently parsed as success.
 - 🇹 **Type-Safe**: 100% TypeScript with Zod validation.
 
 ## Installation
@@ -45,6 +47,8 @@ const page = await AgentCrawl.scrape("https://news.ycombinator.com", {
   mode: "hybrid",            // "static" | "browser" | "hybrid" (default)
   extractMainContent: true,  // Extract only the article body
   optimizeTokens: true,      // Compress excessive whitespace (default: true)
+  stealth: true,             // Enable browser stealth hardening when browser is used
+  stealthLevel: "balanced",  // "basic" | "balanced" (default: "balanced")
   waitFor: ".main-content",  // CSS selector to wait for (browser mode)
 });
 ```
@@ -118,6 +122,8 @@ const response = await client.chat.completions.create({
 | `mode` | `'hybrid'` \| `'static'` \| `'browser'` | `'hybrid'` | Strategy to use. `hybrid` tries static first, then browser. |
 | `extractMainContent` | `boolean` | `false` | Extract only the main article body using Readability-like algorithm. |
 | `optimizeTokens` | `boolean` | `true` | Remove extra whitespace and empty links for token efficiency. |
+| `stealth` | `boolean` | `false` | Apply best-effort browser stealth hardening (browser mode only). |
+| `stealthLevel` | `'basic'` \| `'balanced'` | `'balanced'` | Stealth profile strength when `stealth` is enabled. |
 | `waitFor` | `string` | `undefined` | CSS selector to wait for (browser mode only). |
 
 ### Crawl Options
@@ -143,10 +149,24 @@ Crawl options include all scrape options plus:
   metadata?: {
     status: number;      // HTTP status code
     contentLength: number;
+    error?: string;      // Populated when scrape fails
     // ... other headers
   }
 }
 ```
+
+`scrape()` returns an empty `content` plus `metadata.error` for non-2xx responses or fetch/browser failures.
+
+When browser rendering is used, metadata also includes:
+- `stealthApplied: boolean`
+- `stealthLevel?: "basic" | "balanced"` (when stealth is enabled)
+
+## Stealth Mode (Best-Effort)
+
+- Stealth is opt-in via `stealth: true`.
+- It is applied only for browser rendering (`mode: "browser"` and hybrid browser fallback).
+- It hardens common automation fingerprints (`navigator.webdriver`, language/plugins/platform hints, permission query behavior, and browser headers/profile).
+- It is best-effort: some anti-bot systems may still block requests.
 
 ### `crawl()` → `CrawlResult`
 

@@ -11,19 +11,24 @@ export interface FetchResult {
     status: number;
     headers: Record<string, string>;
     isStaticSuccess: boolean;
+    needsBrowser: boolean;
+    error?: string;
 }
+
+export type StealthLevel = 'basic' | 'balanced';
 
 export interface ScrapeConfig {
     mode?: 'static' | 'hybrid' | 'browser';
-    output?: 'markdown' | 'json';
     waitFor?: string; // CSS selector to wait for (browser mode only)
     extractMainContent?: boolean; // Extract only main content using Readability-like algorithm
     optimizeTokens?: boolean; // Optimize markdown output for token efficiency
+    stealth?: boolean; // Apply browser anti-bot hardening (browser mode only)
+    stealthLevel?: StealthLevel; // Stealth profile intensity
 }
 
 export interface ScrapedPage {
     url: string;
-    content: string; // Markdown or JSON
+    content: string; // Markdown content
     title?: string;
     metadata?: Record<string, any>;
     links?: string[]; // Extracted links from this page

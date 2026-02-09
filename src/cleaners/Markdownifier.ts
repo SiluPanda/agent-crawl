@@ -24,6 +24,9 @@ export class Markdownifier {
         this.turndownService = new TurndownService({
             codeBlockStyle: 'fenced',
             headingStyle: 'atx',
+            // Strip HTML tags that can't be converted cleanly
+            emDelimiter: '*',
+            strongDelimiter: '**',
         });
 
         // Enable GFM tables, strikethrough, and task lists
@@ -37,6 +40,44 @@ export class Markdownifier {
             },
             replacement: () => '' // Strip empty/decorative links
         });
+
+        // Strip images entirely or keep only alt text for LLM consumption
+        this.turndownService.addRule('stripImages', {
+            filter: 'img',
+            replacement: (_content, node) => {
+                const alt = (node as HTMLElement).getAttribute('alt');
+                // Only keep meaningful alt text (not empty, not just file names)
+                if (alt && alt.length > 3 && !alt.match(/\.(png|jpg|jpeg|gif|svg|webp)$/i)) {
+                    return `[Image: ${alt}]`;
+                }
+                return '';
+            }
+        });
+
+        // Strip srcset and other heavy attributes from any remaining HTML
+        this.turndownService.addRule('cleanupHtml', {
+            filter: (node) => {
+                // Clean up any element that has srcset
+                return node.nodeType === 1 && (node as HTMLElement).hasAttribute('srcset');
+            },
+            replacement: (_content, node) => {
+                // Just return the text content
+                return (node as HTMLElement).textContent || '';
+            }
+        });
+
+        // Remove figure/figcaption if they only contain images
+        this.turndownService.addRule('stripFigures', {
+            filter: 'figure',
+            replacement: (content) => {
+                // If content is empty or only whitespace after image removal, skip
+                const cleaned = content.replace(/\[Image:.*?\]/g, '').trim();
+                return cleaned ? cleaned + '\n\n' : '';
+            }
+        });
+
+        // Keep table structure - let GFM plugin handle table conversion
+        this.turndownService.keep(['table', 'thead', 'tbody', 'tr', 'th', 'td']);
     }
 
     /**
@@ -170,6 +211,16 @@ export class Markdownifier {
         $('.cc-banner, .cc-window, #CybotCookiebotDialog, #onetrust-consent-sdk').remove();
         $('[aria-label*="cookie"], [aria-label*="consent"]').remove();
 
+        // LLM-friendly cleaning: Remove visually hidden content
+        $('.vh, .visually-hidden, .sr-only, .screen-reader-only').remove();
+        $('[aria-hidden="true"]').remove();
+
+        // Remove images with srcset (complex responsive images)
+        $('img[srcset]').remove();
+
+        // Strip all class and style attributes for cleaner output
+        $('*').removeAttr('class').removeAttr('style').removeAttr('srcset');
+
         // Extract main content if requested
         if (options.extractMainContent) {
             const mainContent = this.extractMainContent($.html());
@@ -236,7 +287,7 @@ export class Markdownifier {
             '';
 
         // Extract links (before cleaning removes elements)
-        const links: string[] = [];
+        const links = new Set<string>();
         let baseOrigin: string;
         try {
             baseOrigin = new URL(baseUrl).origin;
@@ -247,8 +298,8 @@ export class Markdownifier {
                     const absoluteUrl = new URL(href, baseUrl).href;
                     if (!absoluteUrl.startsWith('http')) return;
                     const cleanUrl = absoluteUrl.split('#')[0];
-                    if (cleanUrl.startsWith(baseOrigin) && !links.includes(cleanUrl)) {
-                        links.push(cleanUrl);
+                    if (cleanUrl.startsWith(baseOrigin)) {
+                        links.add(cleanUrl);
                     }
                 } catch {
                     // Invalid URL, ignore
@@ -270,6 +321,44 @@ export class Markdownifier {
         $('.cc-banner, .cc-window, #CybotCookiebotDialog, #onetrust-consent-sdk').remove();
         $('[aria-label*="cookie"], [aria-label*="consent"]').remove();
 
+        // LLM-friendly cleaning: Remove visually hidden content
+        $('.vh, .visually-hidden, .sr-only, .screen-reader-only').remove();
+        $('[aria-hidden="true"]').remove();
+        $('[class*="hidden"]').each((_, el) => {
+            const className = $(el).attr('class') || '';
+            // Only remove if it's a visibility class, not "hidden-feature" etc
+            if (/\b(hidden|visually-hidden)\b/i.test(className)) {
+                $(el).remove();
+            }
+        });
+
+        // Remove images with srcset (complex responsive images)
+        $('img[srcset]').remove();
+
+        // Remove Wikipedia-style navboxes and templates (|v|t|e navigation)
+        $('[role="navigation"]').remove();
+        $('table').each((_, table) => {
+            const $table = $(table);
+            const text = $table.text();
+            // Remove navboxes (contain v·t·e or v|t|e patterns)
+            if (/\b[vV]\s*[·•|]\s*[tT]\s*[·•|]\s*[eE]\b/.test(text)) {
+                $table.remove();
+            }
+        });
+
+        // Strip all class and style attributes for cleaner output
+        $('*').removeAttr('class').removeAttr('style').removeAttr('srcset');
+
+        // Simplify tables: if a table has complex classes or nested tables, convert to text
+        $('table').each((_, table) => {
+            const $table = $(table);
+            // If table has nested tables or too many attributes, replace with text
+            if ($table.find('table').length > 0) {
+                const text = $table.text().replace(/\s+/g, ' ').trim();
+                $table.replaceWith(`<p>${text}</p>`);
+            }
+        });
+
         let cleanedHtml: string;
         if (options.extractMainContent) {
             cleanedHtml = this.extractMainContentFromCheerio($);
@@ -279,13 +368,17 @@ export class Markdownifier {
 
         // Convert to markdown
         let markdown = this.turndownService.turndown(cleanedHtml);
+
+        // LLM-friendly post-processing
+        markdown = this.cleanForLLM(markdown);
+
         if (options.optimizeTokens) {
             markdown = this.optimizeTokens(markdown);
         }
 
         return {
             title: title.trim(),
-            links,
+            links: Array.from(links),
             markdown,
         };
     }
@@ -310,5 +403,51 @@ export class Markdownifier {
         }
 
         return $('body').html() || '';
+    }
+
+    /**
+     * Clean markdown for LLM consumption
+     * Removes Wikipedia-style citations, navbox remnants, and other noise
+     */
+    private cleanForLLM(markdown: string): string {
+        let cleaned = markdown;
+
+        // Remove Wikipedia-style citation references like [\[1\]](#cite_note-1) or \[1\]
+        cleaned = cleaned.replace(/\\\[\d+\\\]/g, '');
+        cleaned = cleaned.replace(/\[\\\[\d+\\\]\]\([^)]*\)/g, '');
+        cleaned = cleaned.replace(/\[\[(\d+|[a-z])\]\]\([^)]*\)/g, '');
+
+        // Remove empty citation links like [](#cite_note-...) or [](#cite_ref-...)
+        cleaned = cleaned.replace(/\[\]\(#cite[^)]*\)/g, '');
+        cleaned = cleaned.replace(/\[\]\(#[^)]*\)/g, '');
+
+        // Remove remaining citation-style links like [a], [b], [c] references
+        cleaned = cleaned.replace(/\\\[([a-z])\\\]/g, '');
+        cleaned = cleaned.replace(/\[\\\[([a-z])\\\]\]\([^)]*\)/g, '');
+
+        // Remove "Jump to content" and similar skip links
+        cleaned = cleaned.replace(/\[Jump to [^\]]+\]\([^)]*\)/gi, '');
+        cleaned = cleaned.replace(/\[Skip to [^\]]+\]\([^)]*\)/gi, '');
+
+        // Remove navbox patterns that might have leaked through (v·t·e, v|t|e)
+        cleaned = cleaned.replace(/\|\s*\n?\s*\*\s*\[v\]\([^)]*\)\s*\n?\s*\*\s*\[t\]\([^)]*\)\s*\n?\s*\*\s*\[e\]\([^)]*\)/gi, '');
+        cleaned = cleaned.replace(/\[v\]\([^)]*\)\s*[·•|]\s*\[t\]\([^)]*\)\s*[·•|]\s*\[e\]\([^)]*\)/gi, '');
+
+        // Remove "Retrieved from" Wikipedia footers
+        cleaned = cleaned.replace(/Retrieved from "[^"]*"/gi, '');
+
+        // Remove Wikipedia category links
+        cleaned = cleaned.replace(/\[Categories?\]\([^)]*\):[^\n]*/gi, '');
+
+        // Clean up multiple consecutive blank lines
+        cleaned = cleaned.replace(/\n{4,}/g, '\n\n\n');
+
+        // Remove lines that are just pipe characters (table remnants)
+        cleaned = cleaned.replace(/^\s*\|[\s|]*\|?\s*$/gm, '');
+
+        // Clean up orphaned list markers
+        cleaned = cleaned.replace(/^\s*\*\s*$/gm, '');
+
+        return cleaned.trim();
     }
 }
