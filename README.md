@@ -84,6 +84,30 @@ result.pages.forEach(page => {
 | `stealth` | `boolean` | `false` | Apply best-effort browser stealth hardening (browser mode only). |
 | `stealthLevel` | `'basic'` \| `'balanced'` | `'balanced'` | Stealth profile strength when `stealth` is enabled. |
 | `waitFor` | `string` | `undefined` | CSS selector to wait for (browser mode only). |
+| `maxResponseBytes` | `number` | `undefined` | Best-effort cap for static fetch response size in bytes. |
+| `httpCache` | `boolean \| { dir?, ttlMs?, maxEntries? }` | `undefined` | Opt-in disk HTTP cache for static fetch (ETag/Last-Modified). |
+| `cache` | `boolean \| { dir?, ttlMs?, maxEntries? }` | `undefined` | Opt-in disk cache for processed scrape results (`ScrapedPage`). |
+| `chunking` | `boolean \| { enabled?, maxTokens?, overlapTokens? }` | `undefined` | Opt-in token-aware chunking (`page.chunks`) with citation anchors. |
+
+#### Disk Cache Example (HTTP + Processed Result)
+
+```ts
+const page = await AgentCrawl.scrape("https://example.com", {
+  mode: "static",
+  httpCache: { dir: ".cache/agent-crawl/http", ttlMs: 60_000, maxEntries: 1000 },
+  cache: { dir: ".cache/agent-crawl", ttlMs: 5 * 60_000, maxEntries: 1000 },
+});
+```
+
+#### Chunking Example (For Agent RAG/Tools)
+
+```ts
+const page = await AgentCrawl.scrape("https://example.com", {
+  chunking: { enabled: true, maxTokens: 1200, overlapTokens: 100 },
+});
+
+// page.chunks: [{ id, text, approxTokens, headingPath, citation: { url, anchor } }, ...]
+```
 
 ### Crawl Options
 
@@ -94,6 +118,45 @@ Crawl options include all scrape options plus:
 | `maxDepth` | `number` | `1` | Maximum link depth to crawl from the start URL. |
 | `maxPages` | `number` | `10` | Maximum number of pages to crawl. |
 | `concurrency` | `number` | `2` | Number of pages to fetch in parallel. |
+| `perHostConcurrency` | `number` | `concurrency` | Maximum concurrent requests per host. |
+| `minDelayMs` | `number` | `0` | Minimum delay between requests to the same host. |
+| `includePatterns` | `string[]` | `[]` | Only crawl URLs containing any of these substrings. |
+| `excludePatterns` | `string[]` | `[]` | Do not crawl URLs containing any of these substrings. |
+| `robots` | `boolean \| { enabled?, userAgent?, respectCrawlDelay? }` | `undefined` | Opt-in robots.txt compliance (Disallow/Allow + Crawl-delay). |
+| `sitemap` | `boolean \| { enabled?, maxUrls? }` | `undefined` | Opt-in sitemap seeding from `/sitemap.xml`. |
+| `crawlState` | `boolean \| { enabled?, dir?, id?, resume?, flushEvery?, persistPages? }` | `undefined` | Opt-in resumable crawl state persisted to disk. |
+
+#### Polite Crawl Example (Robots + Sitemap + Throttling)
+
+```ts
+const result = await AgentCrawl.crawl("https://docs.example.com", {
+  maxDepth: 2,
+  maxPages: 100,
+  concurrency: 6,
+  perHostConcurrency: 2,
+  minDelayMs: 250,
+  robots: { enabled: true, userAgent: "agent-crawl", respectCrawlDelay: true },
+  sitemap: { enabled: true, maxUrls: 1000 },
+});
+```
+
+#### Resumable Crawl Example
+
+```ts
+const result = await AgentCrawl.crawl("https://docs.example.com", {
+  maxDepth: 3,
+  maxPages: 500,
+  concurrency: 6,
+  crawlState: {
+    enabled: true,
+    dir: ".cache/agent-crawl/state",
+    id: "docs-example",
+    resume: true,
+    flushEvery: 5,
+    persistPages: true,
+  },
+});
+```
 
 ## Return Values
 
@@ -105,10 +168,23 @@ Crawl options include all scrape options plus:
   content: string;       // Clean markdown content
   title?: string;        // Page title
   links?: string[];      // Same-origin links found on the page
+  chunks?: Array<{       // Present only when chunking is enabled
+    id: string;
+    text: string;
+    approxTokens: number;
+    headingPath: string[];
+    citation: { url: string; anchor?: string };
+  }>;
   metadata?: {
     status: number;      // HTTP status code
     contentLength: number;
     error?: string;      // Populated when scrape fails
+    structured?: {       // Structured metadata from HTML (when present)
+      canonicalUrl?: string;
+      openGraph?: Record<string, string>;
+      twitter?: Record<string, string>;
+      jsonLd?: unknown[];
+    };
     // ... other headers
   }
 }
