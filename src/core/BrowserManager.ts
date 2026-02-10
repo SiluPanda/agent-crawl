@@ -5,6 +5,7 @@ export interface BrowserPageResult {
     html: string;
     status: number;
     headers: Record<string, string>;
+    finalUrl?: string;
 }
 
 export interface BrowserPageOptions {
@@ -123,6 +124,7 @@ export class BrowserManager {
                 html: content,
                 status: response?.status() ?? 200,
                 headers: response?.headers() ?? {},
+                finalUrl: response?.url(),
             };
         } catch (e: any) {
             console.error(`[BrowserManager] Failed to load ${url}: ${e.message}`);

@@ -1,4 +1,5 @@
-import { FetchOptions, FetchResult } from '../types.js';
+import { FetchOptions, FetchResult, HttpCacheConfig } from '../types.js';
+import { HttpDiskCache } from './HttpDiskCache.js';
 
 const USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -22,6 +23,17 @@ export class SmartFetcher {
         const ua = USER_AGENTS[this.userAgentIndex];
         this.userAgentIndex = (this.userAgentIndex + 1) % USER_AGENTS.length;
         return ua;
+    }
+
+    private httpCacheFromOptions(httpCache: boolean | HttpCacheConfig | undefined): HttpDiskCache | null {
+        if (!httpCache) return null;
+        const cfg = typeof httpCache === 'boolean' ? {} : httpCache;
+        const enabled = cfg.enabled ?? true;
+        if (!enabled) return null;
+        const dir = cfg.dir ?? '.cache/agent-crawl/http';
+        const ttlMs = cfg.ttlMs ?? 5 * 60_000;
+        const maxEntries = cfg.maxEntries ?? 1000;
+        return new HttpDiskCache({ dir, ttlMs, maxEntries });
     }
 
     /**
@@ -84,13 +96,54 @@ export class SmartFetcher {
         await new Promise((resolve) => setTimeout(resolve, ms));
     }
 
+    private async readBodyWithLimit(response: Response, maxBytes: number): Promise<string> {
+        // Node fetch exposes a web ReadableStream.
+        const body = response.body;
+        if (!body) return '';
+
+        const reader = body.getReader();
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            if (value) {
+                total += value.byteLength;
+                if (total > maxBytes) {
+                    try {
+                        reader.cancel();
+                    } catch {
+                        // ignore
+                    }
+                    throw new Error(`Response too large (>${maxBytes} bytes)`);
+                }
+                chunks.push(value);
+            }
+        }
+
+        const merged = new Uint8Array(total);
+        let offset = 0;
+        for (const c of chunks) {
+            merged.set(c, offset);
+            offset += c.byteLength;
+        }
+        return new TextDecoder('utf-8', { fatal: false }).decode(merged);
+    }
+
     async fetch(url: string, options: FetchOptions = {}): Promise<FetchResult> {
-        const { retries = 2, timeout = 10000 } = options;
+        const { retries = 2, timeout = 10000, maxResponseBytes, httpCache } = options;
+        const cache = this.httpCacheFromOptions(httpCache);
         for (let attempt = 0; attempt <= retries; attempt++) {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeout);
 
             try {
+                const cached = cache ? await cache.get(url) : null;
+                const conditionalHeaders: Record<string, string> = {};
+                if (cached?.entry.etag) conditionalHeaders['If-None-Match'] = cached.entry.etag;
+                if (cached?.entry.lastModified) conditionalHeaders['If-Modified-Since'] = cached.entry.lastModified;
+
                 const response = await fetch(url, {
                     method: options.method || 'GET',
                     headers: {
@@ -98,12 +151,29 @@ export class SmartFetcher {
                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                         'Accept-Language': 'en-US,en;q=0.9',
                         'Accept-Encoding': 'gzip, deflate, br',
+                        ...conditionalHeaders,
                         ...options.headers,
                     },
                     signal: controller.signal,
                 });
 
-                const headers = Object.fromEntries(response.headers.entries());
+                const headers: Record<string, string> = {};
+                response.headers.forEach((value, key) => {
+                    headers[key] = value;
+                });
+
+                if (response.status === 304 && cached) {
+                    return {
+                        url,
+                        finalUrl: response.url,
+                        html: cached.body,
+                        status: 200,
+                        headers: cached.entry.headers,
+                        isStaticSuccess: true,
+                        needsBrowser: false,
+                        error: undefined,
+                    };
+                }
 
                 if (!response.ok) {
                     const isRetryable = response.status >= 500 || response.status === 408 || response.status === 429;
@@ -114,6 +184,7 @@ export class SmartFetcher {
 
                     return {
                         url,
+                        finalUrl: response.url,
                         html: '',
                         status: response.status,
                         headers,
@@ -123,11 +194,34 @@ export class SmartFetcher {
                     };
                 }
 
-                const html = await response.text();
+                let html: string;
+                if (maxResponseBytes && maxResponseBytes > 0) {
+                    const contentLength = Number(response.headers.get('content-length') || '0');
+                    if (contentLength && contentLength > maxResponseBytes) {
+                        return {
+                            url,
+                            finalUrl: response.url,
+                            html: '',
+                            status: response.status,
+                            headers,
+                            isStaticSuccess: false,
+                            needsBrowser: false,
+                            error: `Response too large (>${maxResponseBytes} bytes)`,
+                        };
+                    }
+                    html = await this.readBodyWithLimit(response, maxResponseBytes);
+                } else {
+                    html = await response.text();
+                }
                 const needsJS = this.requiresJavaScript(html, response.headers);
+
+                if (cache && !needsJS) {
+                    await cache.set(url, response.status, headers, html).catch(() => {});
+                }
 
                 return {
                     url,
+                    finalUrl: response.url,
                     html,
                     status: response.status,
                     headers,
@@ -139,6 +233,7 @@ export class SmartFetcher {
                 if (attempt >= retries) {
                     return {
                         url,
+                        finalUrl: url,
                         html: '',
                         status: 0,
                         headers: {},
@@ -155,6 +250,7 @@ export class SmartFetcher {
 
         return {
             url,
+            finalUrl: url,
             html: '',
             status: 0,
             headers: {},

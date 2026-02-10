@@ -11,7 +11,7 @@ It features a **Hybrid Engine** that starts with extremely fast static scraping 
 - 🚀 **Hybrid Engine**: Instant static fetch by default, auto-switch to Headless Browser for dynamic sites.
 - ⚡ **Token Optimized**: Returns clean Markdown, stripping 80-90% of tokens (ads, navs, footers).
 - 🧠 **Agent-First**: Detects Main Content, removes boilerplate, and extracts semantic structure.
-- 🔌 **Plug-and-Play**: Native adapters for **Vercel AI SDK** and **OpenAI Agents SDK**.
+- 🔌 **Plug-and-Play**: Simple API designed for agent runtimes (scrape + crawl).
 - 🛡️ **Production Ready**: Built-in caching, retry logic, user-agent rotation, and resource blocking.
 - 🕵️ **Stealth Mode**: Optional best-effort browser hardening to reduce common bot-detection fingerprints.
 - ✅ **Predictable Errors**: Non-2xx HTTP responses are surfaced as errors instead of silently parsed as success.
@@ -69,47 +69,6 @@ console.log(`Crawled ${result.totalPages} pages`);
 console.log(`Max depth reached: ${result.maxDepthReached}`);
 result.pages.forEach(page => {
   console.log(`- ${page.title}: ${page.url}`);
-});
-```
-
-## AI SDK Integration
-
-### Vercel AI SDK
-
-One-line integration to give your Vercel AI agent browsing and crawling capabilities.
-
-```typescript
-import { generateText } from 'ai';
-import { openai } from '@ai-sdk/openai';
-import { AgentCrawl } from 'agent-crawl';
-
-const result = await generateText({
-  model: openai('gpt-4o'),
-  tools: {
-    browser: AgentCrawl.asVercelTool(),
-    crawler: AgentCrawl.asVercelCrawlTool()
-  },
-  prompt: "Crawl the documentation site and summarize all pages."
-});
-```
-
-### OpenAI Agents SDK through Function Calling
-
-Generates the perfect JSON Schema for OpenAI function calling.
-
-```typescript
-import OpenAI from 'openai';
-import { AgentCrawl } from 'agent-crawl';
-
-const client = new OpenAI();
-
-const response = await client.chat.completions.create({
-  model: 'gpt-4',
-  messages: [{ role: 'user', content: 'Crawl this documentation site...' }],
-  tools: [
-    AgentCrawl.asOpenAITool(),      // Single page scraping
-    AgentCrawl.asOpenAICrawlTool()  // Multi-page crawling
-  ],
 });
 ```
 

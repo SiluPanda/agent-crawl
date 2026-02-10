@@ -311,6 +311,45 @@ test('static mode reports dynamic-content requirement without browser fallback',
     );
 });
 
+test('crawl dedupes pages that resolve to the same final URL (redirect-like)', async () => {
+    const AgentCrawl = await loadAgentCrawl();
+
+    let scrapeCalls: string[] = [];
+
+    await withPatchedStatics(
+        AgentCrawl,
+        [
+            {
+                key: 'scrape',
+                value: async (url: string) => {
+                    scrapeCalls.push(url);
+                    // Simulate start URL resolving to /news.
+                    if (url === 'https://news.ycombinator.com/') {
+                        return makePage(
+                            'https://news.ycombinator.com/news',
+                            'front',
+                            ['https://news.ycombinator.com/news']
+                        );
+                    }
+                    return makePage(url, 'ok', []);
+                },
+            },
+            { key: 'cache', value: noopCache },
+        ],
+        async () => {
+            const result = await AgentCrawl.crawl('https://news.ycombinator.com/', {
+                maxDepth: 1,
+                maxPages: 10,
+                concurrency: 2,
+            });
+
+            assert.equal(result.totalPages, 1);
+            assert.equal(scrapeCalls.length, 1);
+            assert.equal(result.pages[0]?.url, 'https://news.ycombinator.com/news');
+        }
+    );
+});
+
 test('crawl deduplicates queued links before visiting', async () => {
     const AgentCrawl = await loadAgentCrawl();
 

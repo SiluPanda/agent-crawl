@@ -31,7 +31,7 @@ test('scrape schema validates url and mode', () => {
                 url: 'https://example.com',
                 mode: 'invalid',
             }),
-        /Invalid enum value/i
+        /Invalid option/i
     );
 
     assert.throws(
@@ -40,7 +40,7 @@ test('scrape schema validates url and mode', () => {
                 url: 'https://example.com',
                 stealthLevel: 'max',
             }),
-        /Invalid enum value/i
+        /Invalid option/i
     );
 });
 
@@ -61,7 +61,7 @@ test('crawl schema rejects invalid numeric bounds', () => {
                 url: 'https://example.com',
                 maxDepth: 0,
             }),
-        /Number must be greater than or equal to 1/i
+        /Too small|>=1/i
     );
 
     assert.throws(
@@ -70,6 +70,6 @@ test('crawl schema rejects invalid numeric bounds', () => {
                 url: 'https://example.com',
                 concurrency: 0,
             }),
-        /Number must be greater than or equal to 1/i
+        /Too small|>=1/i
     );
 });

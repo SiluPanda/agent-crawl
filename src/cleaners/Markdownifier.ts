@@ -1,5 +1,4 @@
-import TurndownService from 'turndown';
-import { gfm } from 'turndown-plugin-gfm';
+import { NodeHtmlMarkdown } from 'node-html-markdown';
 import * as cheerio from 'cheerio';
 
 export interface MarkdownifierOptions {
@@ -11,6 +10,12 @@ export interface ExtractedContent {
     title: string;
     links: string[];
     markdown: string;
+    structured?: {
+        canonicalUrl?: string;
+        openGraph?: Record<string, string>;
+        twitter?: Record<string, string>;
+        jsonLd?: unknown[];
+    };
 }
 
 /**
@@ -18,66 +23,73 @@ export interface ExtractedContent {
  * Includes noise reduction (ads, scripts) and main content extraction.
  */
 export class Markdownifier {
-    private turndownService: TurndownService;
+    private markdownConverter: NodeHtmlMarkdown;
 
     constructor() {
-        this.turndownService = new TurndownService({
+        this.markdownConverter = new NodeHtmlMarkdown({
             codeBlockStyle: 'fenced',
-            headingStyle: 'atx',
-            // Strip HTML tags that can't be converted cleanly
+            bulletMarker: '*',
             emDelimiter: '*',
             strongDelimiter: '**',
+            strikeDelimiter: '~~',
+            maxConsecutiveNewlines: 3,
+            useInlineLinks: false,
+            textReplace: [
+                [/\u00A0/g, ' '], // Normalize non-breaking spaces
+            ],
         });
+    }
 
-        // Enable GFM tables, strikethrough, and task lists
-        this.turndownService.use(gfm);
+    private escapeHtml(value: string): string {
+        return value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
 
-        // Custom rule to strip decorative links but keep semantic ones
-        this.turndownService.addRule('semanticLinks', {
-            filter: (node) => {
-                return node.nodeName === 'A' &&
-                    (!node.textContent || node.textContent.trim().length === 0);
-            },
-            replacement: () => '' // Strip empty/decorative links
-        });
+    /**
+     * Pre-normalize links/images before markdown conversion.
+     * This preserves prior behavior previously implemented via Turndown custom rules.
+     */
+    private normalizeLinksAndImages($: ReturnType<typeof cheerio.load>): void {
+        // Remove decorative/empty links
+        $('a').each((_, elem) => {
+            const $link = $(elem);
+            const text = $link.text().trim();
+            const href = ($link.attr('href') || '').trim();
 
-        // Strip images entirely or keep only alt text for LLM consumption
-        this.turndownService.addRule('stripImages', {
-            filter: 'img',
-            replacement: (_content, node) => {
-                const alt = (node as HTMLElement).getAttribute('alt');
-                // Only keep meaningful alt text (not empty, not just file names)
-                if (alt && alt.length > 3 && !alt.match(/\.(png|jpg|jpeg|gif|svg|webp)$/i)) {
-                    return `[Image: ${alt}]`;
-                }
-                return '';
+            if (!text) {
+                $link.remove();
+                return;
+            }
+
+            // Keep readable text even if href is malformed/empty.
+            if (!href) {
+                $link.replaceWith(text);
             }
         });
 
-        // Strip srcset and other heavy attributes from any remaining HTML
-        this.turndownService.addRule('cleanupHtml', {
-            filter: (node) => {
-                // Clean up any element that has srcset
-                return node.nodeType === 1 && (node as HTMLElement).hasAttribute('srcset');
-            },
-            replacement: (_content, node) => {
-                // Just return the text content
-                return (node as HTMLElement).textContent || '';
+        // Replace meaningful images with alt text and drop decorative images.
+        $('img').each((_, elem) => {
+            const $img = $(elem);
+            const alt = ($img.attr('alt') || '').trim();
+            if (alt && alt.length > 3 && !alt.match(/\.(png|jpg|jpeg|gif|svg|webp)$/i)) {
+                $img.replaceWith(`<span>[Image: ${this.escapeHtml(alt)}]</span>`);
+            } else {
+                $img.remove();
             }
         });
 
-        // Remove figure/figcaption if they only contain images
-        this.turndownService.addRule('stripFigures', {
-            filter: 'figure',
-            replacement: (content) => {
-                // If content is empty or only whitespace after image removal, skip
-                const cleaned = content.replace(/\[Image:.*?\]/g, '').trim();
-                return cleaned ? cleaned + '\n\n' : '';
+        // Drop figure blocks that became empty after image normalization.
+        $('figure').each((_, elem) => {
+            const $figure = $(elem);
+            const cleaned = $figure.text().replace(/\[Image:.*?\]/g, '').trim();
+            if (!cleaned) {
+                $figure.remove();
             }
         });
-
-        // Keep table structure - let GFM plugin handle table conversion
-        this.turndownService.keep(['table', 'thead', 'tbody', 'tr', 'th', 'td']);
     }
 
     /**
@@ -218,6 +230,8 @@ export class Markdownifier {
         // Remove images with srcset (complex responsive images)
         $('img[srcset]').remove();
 
+        this.normalizeLinksAndImages($);
+
         // Strip all class and style attributes for cleaner output
         $('*').removeAttr('class').removeAttr('style').removeAttr('srcset');
 
@@ -263,7 +277,7 @@ export class Markdownifier {
 
     convert(html: string, options: MarkdownifierOptions = {}): string {
         const cleanedHtml = this.cleanHtml(html, options);
-        let markdown = this.turndownService.turndown(cleanedHtml);
+        let markdown = this.markdownConverter.translate(cleanedHtml);
 
         if (options.optimizeTokens) {
             markdown = this.optimizeTokens(markdown);
@@ -278,6 +292,34 @@ export class Markdownifier {
      */
     extractAll(html: string, baseUrl: string, options: MarkdownifierOptions = {}): ExtractedContent {
         const $ = cheerio.load(html);
+
+        // Structured metadata (JSON-LD / OpenGraph / Twitter / canonical).
+        const openGraph: Record<string, string> = {};
+        const twitter: Record<string, string> = {};
+        $('meta[property^="og:"]').each((_, el) => {
+            const key = ($(el).attr('property') || '').trim();
+            const value = ($(el).attr('content') || '').trim();
+            if (key && value) openGraph[key] = value;
+        });
+        $('meta[name^="twitter:"]').each((_, el) => {
+            const key = ($(el).attr('name') || '').trim();
+            const value = ($(el).attr('content') || '').trim();
+            if (key && value) twitter[key] = value;
+        });
+        const canonicalUrl = ($('link[rel="canonical"]').attr('href') || '').trim() || undefined;
+
+        const jsonLd: unknown[] = [];
+        $('script[type="application/ld+json"]').each((_, el) => {
+            const text = $(el).text().trim();
+            if (!text) return;
+            try {
+                const parsed = JSON.parse(text);
+                if (Array.isArray(parsed)) jsonLd.push(...parsed);
+                else jsonLd.push(parsed);
+            } catch {
+                // ignore invalid JSON-LD blocks
+            }
+        });
 
         // Extract title (single parse)
         const title = $('title').first().text() ||
@@ -335,6 +377,8 @@ export class Markdownifier {
         // Remove images with srcset (complex responsive images)
         $('img[srcset]').remove();
 
+        this.normalizeLinksAndImages($);
+
         // Remove Wikipedia-style navboxes and templates (|v|t|e navigation)
         $('[role="navigation"]').remove();
         $('table').each((_, table) => {
@@ -367,7 +411,7 @@ export class Markdownifier {
         }
 
         // Convert to markdown
-        let markdown = this.turndownService.turndown(cleanedHtml);
+        let markdown = this.markdownConverter.translate(cleanedHtml);
 
         // LLM-friendly post-processing
         markdown = this.cleanForLLM(markdown);
@@ -380,6 +424,12 @@ export class Markdownifier {
             title: title.trim(),
             links: Array.from(links),
             markdown,
+            structured: {
+                canonicalUrl,
+                openGraph: Object.keys(openGraph).length ? openGraph : undefined,
+                twitter: Object.keys(twitter).length ? twitter : undefined,
+                jsonLd: jsonLd.length ? jsonLd : undefined,
+            },
         };
     }
 
