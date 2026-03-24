@@ -132,12 +132,17 @@ export class SmartFetcher {
         return false;
     }
 
+    private static readonly MAX_ERROR_MSG_LENGTH = 500;
+
     private getErrorMessage(error: unknown): string {
         if (error instanceof Error) {
             if (error.name === 'AbortError') {
                 return 'Request timed out';
             }
-            return error.message;
+            const msg = error.message;
+            return msg.length > SmartFetcher.MAX_ERROR_MSG_LENGTH
+                ? msg.slice(0, SmartFetcher.MAX_ERROR_MSG_LENGTH) + '...'
+                : msg;
         }
         return 'Unknown fetch error';
     }
@@ -292,13 +297,14 @@ export class SmartFetcher {
             };
         }
 
-        // Filter dangerous headers from user-supplied options before use
-        const safeUserHeaders: Record<string, string> = {};
+        // Filter dangerous headers and cap value lengths from user-supplied options
+        const safeUserHeaders: Record<string, string> = Object.create(null);
         if (options.headers) {
             for (const [k, v] of Object.entries(options.headers)) {
-                if (!BLOCKED_REQUEST_HEADERS.has(k.toLowerCase())) {
-                    safeUserHeaders[k] = v;
-                }
+                if (typeof k !== 'string' || typeof v !== 'string') continue;
+                if (BLOCKED_REQUEST_HEADERS.has(k.toLowerCase())) continue;
+                // Cap individual header value length to prevent memory abuse
+                safeUserHeaders[k] = v.length > 8192 ? v.slice(0, 8192) : v;
             }
         }
 
@@ -376,6 +382,21 @@ export class SmartFetcher {
                     nextUrl.username = '';
                     nextUrl.password = '';
 
+                    // Check protocol BEFORE hostname — javascript:/data: URLs have empty
+                    // hostnames which would trigger isPrivateHost with a misleading error.
+                    if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
+                        return {
+                            url,
+                            finalUrl: currentUrl,
+                            html: '',
+                            status: 0,
+                            headers: {},
+                            isStaticSuccess: false,
+                            needsBrowser: false,
+                            error: `Redirect to non-HTTP protocol blocked: ${nextUrl.protocol}`,
+                        };
+                    }
+
                     // SSRF: validate redirect target is not a private host
                     if (isPrivateHost(nextUrl.hostname)) {
                         return {
@@ -387,20 +408,6 @@ export class SmartFetcher {
                             isStaticSuccess: false,
                             needsBrowser: false,
                             error: 'Redirect to private/internal host blocked',
-                        };
-                    }
-
-                    // Only follow http/https redirects
-                    if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') {
-                        return {
-                            url,
-                            finalUrl: currentUrl,
-                            html: '',
-                            status: 0,
-                            headers: {},
-                            isStaticSuccess: false,
-                            needsBrowser: false,
-                            error: `Redirect to non-HTTP protocol blocked: ${nextUrl.protocol}`,
                         };
                     }
 

@@ -90,7 +90,7 @@ const PRIVATE_HOST_PATTERNS = [
     /^\[::1?\]$/,               // IPv6 loopback
     /^\[fd[0-9a-f]{2}:/i,      // IPv6 ULA
     /^\[fe80:/i,                // IPv6 link-local
-    /^\[0*:0*:0*:0*:0*:0*:0*:[01]\]$/, // Expanded IPv6 loopback variants
+    /^\[0*:0*:0*:0*:0*:0*:0*:0*[01]\]$/, // Expanded IPv6 loopback variants (0*[01] handles zero-padded 0001)
     /\.local$/i,
     /\.internal$/i,
     /\.localhost$/i,              // RFC 6761 reserved

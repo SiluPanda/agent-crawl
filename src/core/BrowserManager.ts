@@ -109,6 +109,8 @@ export class BrowserManager {
     private static readonly OVERALL_TIMEOUT_MS = 45_000; // 45s hard cap for entire getPage
     private static readonly MAX_PAGE_CONTENT_BYTES = 20 * 1024 * 1024; // 20MB cap for page content
     private static readonly MAX_CONCURRENT_PAGES = 10; // Limit concurrent browser contexts to prevent OOM
+    private static readonly MAX_RESPONSE_HEADERS = 200;
+    private static readonly MAX_HEADER_VALUE_LEN = 8192;
 
     async getPage(url: string, waitForSelector?: string, options: BrowserPageOptions = {}): Promise<BrowserPageResult> {
         if (url.length > 8192) {
@@ -267,14 +269,25 @@ export class BrowserManager {
             if (Buffer.byteLength(content, 'utf-8') > BrowserManager.MAX_PAGE_CONTENT_BYTES) {
                 throw new Error(`Page content too large (>${BrowserManager.MAX_PAGE_CONTENT_BYTES} bytes)`);
             }
+            // Cap response headers to prevent memory exhaustion from malicious servers
+            const rawHeaders = response?.headers() ?? {};
+            const cappedHeaders: Record<string, string> = Object.create(null);
+            let hdrCount = 0;
+            for (const [k, v] of Object.entries(rawHeaders)) {
+                if (hdrCount >= BrowserManager.MAX_RESPONSE_HEADERS) break;
+                cappedHeaders[k] = typeof v === 'string' && v.length > BrowserManager.MAX_HEADER_VALUE_LEN
+                    ? v.slice(0, BrowserManager.MAX_HEADER_VALUE_LEN) : String(v);
+                hdrCount++;
+            }
             return {
                 html: content,
                 status: response?.status() ?? 200,
-                headers: response?.headers() ?? {},
+                headers: cappedHeaders,
                 finalUrl,
             };
         } catch (e: any) {
-            console.error(`[BrowserManager] Failed to load ${sanitizeUrlForLog(url)}: ${e instanceof Error ? e.message : String(e)}`);
+            const errDetail = e instanceof Error ? e.message : String(e);
+            console.error(`[BrowserManager] Failed to load ${sanitizeUrlForLog(url)}: ${errDetail.length > 500 ? errDetail.slice(0, 500) + '...' : errDetail}`);
             throw e;
         } finally {
             await context.close().catch(() => {});
@@ -458,6 +471,8 @@ export class BrowserManager {
      * Attempt to dismiss cookie consent banners by clicking common accept buttons.
      * Fails silently if no banner is found.
      */
+    private static readonly COOKIE_BANNER_TIMEOUT_MS = 2000; // 2s max for banner dismissal
+
     private async dismissCookieBanners(page: Page): Promise<void> {
         const acceptSelectors = [
             // Common accept button patterns
@@ -486,8 +501,10 @@ export class BrowserManager {
         ];
 
         const urlBefore = page.url();
+        const deadline = Date.now() + BrowserManager.COOKIE_BANNER_TIMEOUT_MS;
 
         for (const selector of acceptSelectors) {
+            if (Date.now() > deadline) return; // Time budget exhausted
             try {
                 const button = await page.$(selector);
                 if (button && await button.isVisible()) {

