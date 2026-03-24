@@ -248,27 +248,36 @@ export class Markdownifier {
      * Optimize markdown for token efficiency
      */
     private optimizeTokens(markdown: string): string {
-        // Remove excessive whitespace
-        markdown = markdown.replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
-        markdown = markdown.replace(/[ \t]+/g, ' '); // Collapse spaces
+        // Split into code blocks and non-code segments to preserve code formatting
+        const parts = markdown.split(/(```[\s\S]*?```)/g);
+        const optimized = parts.map((part, i) => {
+            // Odd indices are code blocks (captured groups) — preserve as-is
+            if (i % 2 === 1) return part;
 
-        // Remove empty links
-        markdown = markdown.replace(/\[]\(\)/g, '');
-
-        // Trim lines
-        markdown = markdown.split('\n').map(line => line.trim()).join('\n');
+            // Non-code content: apply whitespace optimization
+            let text = part;
+            text = text.replace(/\n{3,}/g, '\n\n'); // Max 2 consecutive newlines
+            text = text.replace(/[ \t]+/g, ' '); // Collapse spaces
+            text = text.replace(/\[]\(\)/g, ''); // Remove empty links
+            text = text.split('\n').map(line => line.trim()).join('\n');
+            return text;
+        });
+        markdown = optimized.join('');
 
         // Remove repetitive patterns (like navigation items)
-        // This is a simple heuristic - could be enhanced
         const lines = markdown.split('\n');
         const uniqueLines: string[] = [];
         const seen = new Set<string>();
+        let inCodeBlock = false;
 
         for (const line of lines) {
-            // Keep headers and non-repetitive content
-            if (line.startsWith('#') || !seen.has(line) || line.length > 100) {
+            // Track code block boundaries for dedup skipping
+            if (line.startsWith('```')) inCodeBlock = !inCodeBlock;
+
+            // Never deduplicate inside code blocks
+            if (inCodeBlock || line === '' || line.startsWith('#') || !seen.has(line) || line.length > 100) {
                 uniqueLines.push(line);
-                if (line.length < 100) seen.add(line);
+                if (!inCodeBlock && line.length > 0 && line.length < 100) seen.add(line);
             }
         }
 
@@ -399,7 +408,7 @@ export class Markdownifier {
             // If table has nested tables or too many attributes, replace with text
             if ($table.find('table').length > 0) {
                 const text = $table.text().replace(/\s+/g, ' ').trim();
-                $table.replaceWith(`<p>${text}</p>`);
+                $table.replaceWith(`<p>${this.escapeHtml(text)}</p>`);
             }
         });
 

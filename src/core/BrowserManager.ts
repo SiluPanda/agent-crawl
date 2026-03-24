@@ -1,5 +1,6 @@
 import { chromium, Browser, BrowserContext, BrowserContextOptions, Page, Route } from 'playwright-core';
 import { StealthLevel } from '../types.js';
+import { isPrivateHost, sanitizeUrlForLog } from './UrlUtils.js';
 
 export interface BrowserPageResult {
     html: string;
@@ -23,6 +24,8 @@ export class BrowserManager {
     private static instance: BrowserManager;
     private idleTimeout: NodeJS.Timeout | null = null;
     private readonly IDLE_TIME_MS = 5000; // 5 seconds idle before close
+    private activePages = 0; // Track active getPage() calls to prevent premature close
+    private closing: Promise<void> | null = null; // Serialize close operations
 
     // Singleton
     static getInstance(): BrowserManager {
@@ -39,6 +42,11 @@ export class BrowserManager {
     private readonly STEALTH_SEC_CH_UA = '"Not_A Brand";v="99", "Chromium";v="123", "Google Chrome";v="123"';
 
     async launch(): Promise<Browser> {
+        // Wait for any in-progress close to finish before launching
+        if (this.closing) {
+            await this.closing;
+        }
+
         // Check if existing browser is still valid and connected
         if (this.browser && this.browser.isConnected()) {
             return this.browser;
@@ -80,21 +88,33 @@ export class BrowserManager {
      * - Auto-closes context
      */
     async getPage(url: string, waitForSelector?: string, options: BrowserPageOptions = {}): Promise<BrowserPageResult> {
+        // SSRF protection: reject private/internal hosts
+        try {
+            const parsed = new URL(url);
+            if (isPrivateHost(parsed.hostname)) {
+                throw new Error('Request to private/internal host blocked');
+            }
+        } catch (e: any) {
+            if (e.message.includes('private/internal')) throw e;
+            throw new Error(`Invalid URL: ${sanitizeUrlForLog(url)}`);
+        }
+
         const stealth = options.stealth ?? false;
         const stealthLevel = options.stealthLevel ?? 'balanced';
         const browser = await this.launch();
         const context = await browser.newContext(this.getContextOptions(stealth));
-        if (stealth) {
-            await this.applyStealth(context, stealthLevel);
-        }
-        const page = await context.newPage();
 
-        // Set default timeout for all operations to prevent hangs
-        page.setDefaultTimeout(15000); // 15 seconds max for any operation
-
+        this.activePages++;
         this.clearIdleTimer(); // We are active
 
         try {
+            if (stealth) {
+                await this.applyStealth(context, stealthLevel);
+            }
+            const page = await context.newPage();
+
+            // Set default timeout for all operations to prevent hangs
+            page.setDefaultTimeout(15000); // 15 seconds max for any operation
             // Optimization: Block unnecessary resources
             // This drastically reduces load time and bandwidth usage
             const blockedResourceTypes = stealth
@@ -102,6 +122,21 @@ export class BrowserManager {
                 : ['image', 'stylesheet', 'font', 'media'];
             await page.route('**/*', (route: Route) => {
                 const request = route.request();
+
+                // SSRF protection: block ALL requests to private/internal hosts
+                // This intercepts redirects and sub-resources BEFORE the connection is made
+                try {
+                    const reqUrl = new URL(request.url());
+                    if (isPrivateHost(reqUrl.hostname)) {
+                        return route.abort('blockedbyclient');
+                    }
+                    if (reqUrl.protocol !== 'http:' && reqUrl.protocol !== 'https:') {
+                        return route.abort('blockedbyclient');
+                    }
+                } catch {
+                    return route.abort('blockedbyclient');
+                }
+
                 const resourceType = request.resourceType();
                 if (blockedResourceTypes.includes(resourceType)) {
                     return route.abort();
@@ -110,6 +145,18 @@ export class BrowserManager {
             });
 
             const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+            // Secondary SSRF check on the final URL (defense in depth)
+            const finalUrl = response?.url() ?? page.url();
+            try {
+                const finalParsed = new URL(finalUrl);
+                if (isPrivateHost(finalParsed.hostname)) {
+                    throw new Error('Redirect to private/internal host blocked');
+                }
+            } catch (e: any) {
+                if (e.message.includes('private/internal')) throw e;
+                throw new Error(`Navigation resulted in invalid URL: ${sanitizeUrlForLog(finalUrl)}`);
+            }
 
             // Try to dismiss cookie consent banners
             await this.dismissCookieBanners(page);
@@ -124,13 +171,14 @@ export class BrowserManager {
                 html: content,
                 status: response?.status() ?? 200,
                 headers: response?.headers() ?? {},
-                finalUrl: response?.url(),
+                finalUrl,
             };
         } catch (e: any) {
-            console.error(`[BrowserManager] Failed to load ${url}: ${e.message}`);
+            console.error(`[BrowserManager] Failed to load ${sanitizeUrlForLog(url)}: ${e.message}`);
             throw e;
         } finally {
             await context.close().catch(() => {});
+            this.activePages = Math.max(0, this.activePages - 1);
             this.resetIdleTimer();
         }
     }
@@ -281,12 +329,30 @@ export class BrowserManager {
     }
 
     async close() {
-        this.launchPromise = null;
-        if (this.browser) {
-            console.log('[BrowserManager] Closing browser instance (idle).');
-            await this.browser.close();
-            this.browser = null;
+        // Skip close if pages are still active (idle timer will retry)
+        if (this.activePages > 0) return;
+
+        // Clear idle timer to prevent stale timer from closing a future browser instance
+        this.clearIdleTimer();
+
+        if (this.closing) {
+            return this.closing;
         }
+
+        this.closing = (async () => {
+            try {
+                this.launchPromise = null;
+                if (this.browser) {
+                    console.log('[BrowserManager] Closing browser instance (idle).');
+                    await this.browser.close();
+                    this.browser = null;
+                }
+            } finally {
+                this.closing = null;
+            }
+        })();
+
+        return this.closing;
     }
 
     /**

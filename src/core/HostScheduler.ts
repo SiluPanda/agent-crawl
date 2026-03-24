@@ -1,11 +1,14 @@
 export class HostScheduler {
     private inflightByHost = new Map<string, number>();
     private lastStartByHost = new Map<string, number>();
+    private readonly perHostConcurrency: number;
+    private readonly minDelayMs: number;
 
-    constructor(
-        private readonly perHostConcurrency: number,
-        private readonly minDelayMs: number
-    ) {}
+    constructor(perHostConcurrency: number, minDelayMs: number) {
+        // Guard: concurrency of 0 would cause acquire() to spin forever
+        this.perHostConcurrency = Math.max(1, perHostConcurrency);
+        this.minDelayMs = minDelayMs;
+    }
 
     async run<T>(host: string, fn: () => Promise<T>): Promise<T> {
         await this.acquire(host);
@@ -38,6 +41,18 @@ export class HostScheduler {
         const inflight = this.inflightByHost.get(host) ?? 0;
         if (inflight <= 1) {
             this.inflightByHost.delete(host);
+            // Keep lastStartByHost so minDelayMs is enforced for the next request.
+            // Schedule cleanup after the delay window to prevent unbounded map growth.
+            if (this.minDelayMs > 0) {
+                setTimeout(() => {
+                    // Only delete if no new requests started for this host
+                    if (!this.inflightByHost.has(host)) {
+                        this.lastStartByHost.delete(host);
+                    }
+                }, this.minDelayMs).unref();
+            } else {
+                this.lastStartByHost.delete(host);
+            }
             return;
         }
         this.inflightByHost.set(host, inflight - 1);

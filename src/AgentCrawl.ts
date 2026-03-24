@@ -3,7 +3,7 @@ import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
 import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig } from './types.js';
-import { normalizeUrl, safeHttpUrl } from './core/UrlUtils.js';
+import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
 import { HostScheduler } from './core/HostScheduler.js';
 import { DiskKv } from './core/DiskKv.js';
@@ -91,7 +91,9 @@ export class AgentCrawl {
 
     private static crawlStatePath(startUrl: string, cfg: CrawlStateConfig): string {
         const dir = cfg.dir ?? '.cache/agent-crawl/state';
-        const id = cfg.id ?? createHash('sha256').update(startUrl).digest('hex').slice(0, 16);
+        const rawId = cfg.id ?? createHash('sha256').update(startUrl).digest('hex').slice(0, 16);
+        // Sanitize id to prevent path traversal — allow only alphanumeric, hyphens, underscores
+        const id = rawId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
         return path.join(dir, `${id}.json`);
     }
 
@@ -106,9 +108,9 @@ export class AgentCrawl {
             content: '',
             title: '',
             metadata: {
-                ...headers,
                 status,
                 error,
+                responseHeaders: headers,
             },
         };
     }
@@ -166,7 +168,7 @@ export class AgentCrawl {
         // 2. Fallback to Browser (if mode is browser or hybrid fallback needed)
         // Triggered only for browser mode or hybrid dynamic-content fallback.
         if (shouldUseBrowserFallback && !html) {
-            console.log(`Switching to Browser for ${url}...`);
+            console.log(`Switching to Browser for ${sanitizeUrlForLog(url)}...`);
             try {
                 const browserOptions: BrowserPageOptions = {
                     stealth,
@@ -183,7 +185,7 @@ export class AgentCrawl {
                     return this.toErrorPage(url, `Browser fetch returned HTTP ${status}`, status, headers);
                 }
             } catch (e: any) {
-                console.error(`Browser scrape failed: ${e.message}`);
+                console.error(`Browser scrape failed for ${sanitizeUrlForLog(url)}: ${e.message}`);
                 return this.toErrorPage(url, `Browser scrape failed: ${e.message}`, 0, headers);
             }
         }
@@ -208,11 +210,13 @@ export class AgentCrawl {
             title: extracted.title,
             links: extracted.links,
             metadata: (() => {
+                // Place response headers under a dedicated key to prevent
+                // server-controlled header names from overwriting reserved fields
                 const metadata: Record<string, any> = {
-                    ...headers,
                     status,
                     contentLength: extracted.markdown.length,
                     structured: extracted.structured,
+                    responseHeaders: headers,
                 };
 
                 if (browserUsed) {
@@ -303,11 +307,13 @@ export class AgentCrawl {
             };
         }
 
-        const scheduler = new HostScheduler(perHostConcurrency, config.minDelayMs ?? 0);
         let robots: RobotsTxt | null = null;
         if (robotsEnabled) {
             robots = await fetchRobotsTxt(baseOrigin, robotsUserAgent);
         }
+        const robotsCrawlDelayMs = (respectCrawlDelay && robots?.rules.crawlDelayMs) ? robots.rules.crawlDelayMs : 0;
+        const effectiveMinDelay = Math.max(config.minDelayMs ?? 0, robotsCrawlDelayMs);
+        const scheduler = new HostScheduler(perHostConcurrency, effectiveMinDelay);
 
         const matchesPatterns = (url: string): boolean => {
             const included = includePatterns.length === 0
@@ -327,6 +333,9 @@ export class AgentCrawl {
             return true;
         };
 
+        // Cap queue size to prevent memory exhaustion on link-heavy sites
+        const maxQueueSize = Math.max(maxPages * 20, 10_000);
+
         const visited = new Set<string>();
         const queued = new Set<string>();
         const pages: ScrapedPage[] = [];
@@ -339,18 +348,39 @@ export class AgentCrawl {
             try {
                 const raw = await fs.readFile(statePath, 'utf-8');
                 const parsed = JSON.parse(raw) as any;
-                if (parsed?.queue && parsed?.visited && parsed?.queued) {
-                    for (const u of parsed.visited as string[]) visited.add(u);
-                    for (const u of parsed.queued as string[]) queued.add(u);
-                    if (stateCfg.persistPages && Array.isArray(parsed.pages)) pages.push(...(parsed.pages as ScrapedPage[]));
-                    if (Array.isArray(parsed.errors)) errors.push(...parsed.errors);
-                    maxDepthReached = parsed.maxDepthReached ?? 0;
-                    // Hydrate queue after sets exist.
-                    for (const item of parsed.queue as Array<{ url: string; depth: number }>) {
+                if (
+                    parsed?.version === 1 &&
+                    Array.isArray(parsed?.queue) &&
+                    Array.isArray(parsed?.visited) &&
+                    Array.isArray(parsed?.queued)
+                ) {
+                    for (const u of parsed.visited) {
+                        if (typeof u === 'string') visited.add(u);
+                    }
+                    // Skip loading parsed.queued into the queued set — stale entries
+                    // would permanently block organic link discovery.
+                    // The re-validation loop below adds valid items to both queue and queued.
+                    if (stateCfg.persistPages && Array.isArray(parsed.pages)) {
+                        for (const p of parsed.pages) {
+                            if (p && typeof p.url === 'string' && typeof p.content === 'string') {
+                                pages.push(p as ScrapedPage);
+                            }
+                        }
+                    }
+                    if (Array.isArray(parsed.errors)) {
+                        for (const e of parsed.errors) {
+                            if (e && typeof e.url === 'string' && typeof e.error === 'string') {
+                                errors.push(e);
+                            }
+                        }
+                    }
+                    maxDepthReached = typeof parsed.maxDepthReached === 'number' ? parsed.maxDepthReached : 0;
+                    for (const item of parsed.queue) {
                         if (typeof item?.url === 'string' && typeof item?.depth === 'number') {
-                            // Avoid re-queueing already visited.
-                            if (!visited.has(item.url)) {
+                            // Re-validate restored items against current robots.txt, patterns, and origin
+                            if (!visited.has(item.url) && shouldQueue(item.url) && item.depth <= maxDepth) {
                                 queue.push(item);
+                                queued.add(item.url);
                             }
                         }
                     }
@@ -376,6 +406,7 @@ export class AgentCrawl {
                 if (res.status >= 200 && res.status < 300 && res.html) {
                     const locs = Array.from(res.html.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)).map((m) => m[1]);
                     for (const loc of locs.slice(0, sitemapMaxUrls)) {
+                        if (queue.length >= maxQueueSize) break;
                         const normalized = this.normalizeUrlForDedupe(loc);
                         if (shouldQueue(normalized) && !queued.has(normalized) && !visited.has(normalized)) {
                             queue.push({ url: normalized, depth: 0 });
@@ -388,6 +419,7 @@ export class AgentCrawl {
             }
         }
 
+        const MAX_STATE_BYTES = 100 * 1024 * 1024; // 100MB cap for state file
         const persistState = async () => {
             if (!stateEnabled || !statePath) return;
             await fs.mkdir(path.dirname(statePath), { recursive: true }).catch(() => {});
@@ -404,8 +436,25 @@ export class AgentCrawl {
                 maxDepthReached,
                 updatedAt: Date.now(),
             };
-            await fs.writeFile(tmp, JSON.stringify(payload), 'utf-8');
-            await fs.rename(tmp, statePath);
+            let json: string;
+            try {
+                json = JSON.stringify(payload);
+            } catch {
+                // JSON.stringify can throw on circular refs or exceed string limits
+                return;
+            }
+            if (json.length > MAX_STATE_BYTES) {
+                // Retry without pages to stay within the size cap
+                payload.pages = [];
+                try { json = JSON.stringify(payload); } catch { return; }
+            }
+            try {
+                await fs.writeFile(tmp, json, 'utf-8');
+                await fs.rename(tmp, statePath);
+            } catch (e) {
+                await fs.unlink(tmp).catch(() => {});
+                throw e;
+            }
         };
 
         let batches = 0;
@@ -430,14 +479,13 @@ export class AgentCrawl {
             // Process batch concurrently
             const results = await Promise.allSettled(
                 batch.map(async ({ url, depth }) => {
-                    const host = new URL(url).host;
-                    const delayMs = respectCrawlDelay && robots?.rules.crawlDelayMs ? robots.rules.crawlDelayMs : 0;
-                    const effectiveDelay = Math.max(config.minDelayMs ?? 0, delayMs);
-                    const localScheduler = effectiveDelay === (config.minDelayMs ?? 0)
-                        ? scheduler
-                        : new HostScheduler(perHostConcurrency, effectiveDelay);
-
-                    const page = await localScheduler.run(host, async () => this.scrape(url, scrapeConfig));
+                    let host: string;
+                    try {
+                        host = new URL(url).host;
+                    } catch {
+                        throw new Error(`Malformed URL in queue: ${url.slice(0, 100)}`);
+                    }
+                    const page = await scheduler.run(host, async () => this.scrape(url, scrapeConfig));
                     return { page, depth };
                 })
             );
@@ -460,6 +508,7 @@ export class AgentCrawl {
                         // Add discovered links to queue (if not at max depth)
                         if (depth < maxDepth && page.links) {
                             for (const link of page.links) {
+                                if (queue.length >= maxQueueSize) break;
                                 const normalizedLink = this.normalizeUrlForDedupe(link);
                                 // Only add same-origin links that aren't visited or already queued
                                 if (shouldQueue(normalizedLink) && !visited.has(normalizedLink) && !queued.has(normalizedLink)) {

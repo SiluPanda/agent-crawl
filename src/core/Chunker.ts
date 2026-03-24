@@ -59,21 +59,63 @@ export function chunkMarkdown(markdown: string, options: ChunkerOptions): Conten
     let bufPath: string[] = [];
     let lastChunkTail = '';
 
-    const emit = () => {
-        const text = buf.trim();
+    const emitText = (text: string, path: string[]) => {
+        text = text.trim();
         if (!text) return;
+
+        // If text still exceeds maxChars, split at word/sentence boundaries
+        if (text.length > maxChars) {
+            let remaining = text;
+            while (remaining.length > maxChars) {
+                // Find a split point: prefer sentence end, then word boundary
+                let splitAt = maxChars;
+                const sentenceEnd = remaining.lastIndexOf('. ', maxChars);
+                if (sentenceEnd > maxChars * 0.5) {
+                    splitAt = sentenceEnd + 1; // include the period
+                } else {
+                    const wordBreak = remaining.lastIndexOf(' ', maxChars);
+                    if (wordBreak > maxChars * 0.3) {
+                        splitAt = wordBreak;
+                    }
+                }
+                const piece = remaining.slice(0, splitAt).trim();
+                if (piece) {
+                    const id = `chunk_${chunks.length + 1}`;
+                    const anchorHeading = path.length ? path[path.length - 1] : '';
+                    const anchor = anchorHeading ? slugify(anchorHeading) : undefined;
+                    chunks.push({ id, text: piece, approxTokens: approxTokens(piece), headingPath: path, citation: { url: options.url, anchor } });
+                }
+                remaining = remaining.slice(splitAt).trim();
+            }
+            if (remaining) {
+                const id = `chunk_${chunks.length + 1}`;
+                const anchorHeading = path.length ? path[path.length - 1] : '';
+                const anchor = anchorHeading ? slugify(anchorHeading) : undefined;
+                chunks.push({ id, text: remaining, approxTokens: approxTokens(remaining), headingPath: path, citation: { url: options.url, anchor } });
+                lastChunkTail = overlapChars > 0 ? remaining.slice(Math.max(0, remaining.length - overlapChars)) : '';
+            }
+            return;
+        }
+
         const id = `chunk_${chunks.length + 1}`;
-        const anchorHeading = bufPath.length ? bufPath[bufPath.length - 1] : '';
+        const anchorHeading = path.length ? path[path.length - 1] : '';
         const anchor = anchorHeading ? slugify(anchorHeading) : undefined;
         chunks.push({
             id,
             text,
             approxTokens: approxTokens(text),
-            headingPath: bufPath,
+            headingPath: path,
             citation: { url: options.url, anchor },
         });
         lastChunkTail = overlapChars > 0 ? text.slice(Math.max(0, text.length - overlapChars)) : '';
     };
+
+    const emit = () => {
+        emitText(buf, bufPath);
+        buf = '';
+    };
+
+    const maxChars = maxTokens * 4;
 
     for (const block of blocks) {
         const candidate = (buf ? `${buf}\n\n${block.text}` : block.text).trim();
@@ -83,10 +125,30 @@ export function chunkMarkdown(markdown: string, options: ChunkerOptions): Conten
             continue;
         }
 
-        // Emit current chunk and start a new one with optional overlap.
+        // Emit current buffer before processing this block.
         emit();
-        buf = (lastChunkTail ? `${lastChunkTail}\n\n${block.text}` : block.text).trim();
-        bufPath = block.headingPath;
+
+        // If the block itself exceeds maxTokens, split it at line boundaries.
+        if (approxTokens(block.text) > maxTokens) {
+            const blockLines = block.text.split('\n');
+            let lineBuf = lastChunkTail || '';
+            for (const ln of blockLines) {
+                const next = lineBuf ? `${lineBuf}\n${ln}` : ln;
+                if (next.length > maxChars && lineBuf) {
+                    buf = lineBuf.trim();
+                    bufPath = block.headingPath;
+                    emit();
+                    lineBuf = (lastChunkTail ? `${lastChunkTail}\n${ln}` : ln);
+                } else {
+                    lineBuf = next;
+                }
+            }
+            buf = lineBuf.trim();
+            bufPath = block.headingPath;
+        } else {
+            buf = (lastChunkTail ? `${lastChunkTail}\n\n${block.text}` : block.text).trim();
+            bufPath = block.headingPath;
+        }
     }
     emit();
 

@@ -38,7 +38,7 @@ export const ScrapeOptionsSchema = z.object({
 });
 
 export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({
-    maxDepth: z.number().int().min(1).default(1),
+    maxDepth: z.number().int().min(0).default(1),
     maxPages: z.number().int().min(1).default(10),
     concurrency: z.number().int().min(1).default(2),
     perHostConcurrency: z.number().int().min(1).optional().describe('Maximum concurrent requests per host (defaults to concurrency)'),

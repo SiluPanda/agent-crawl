@@ -16,7 +16,8 @@ export class CacheManager {
     }
 
     /**
-     * Retrieve item and update its position (LRU)
+     * Retrieve item and update its position (LRU).
+     * Preserves original timestamp for TTL expiry.
      */
     get(key: string): ScrapedPage | null {
         const item = this.cache.get(key);
@@ -27,14 +28,16 @@ export class CacheManager {
             return null;
         }
 
-        // Refresh LRU order and update timestamp for active items
+        // Re-insert to refresh LRU order but keep original timestamp for TTL
         this.cache.delete(key);
-        this.cache.set(key, { data: item.data, timestamp: Date.now() });
+        this.cache.set(key, item);
 
         return item.data;
     }
 
     set(key: string, data: ScrapedPage): void {
+        // Delete first to update LRU position if key already exists
+        this.cache.delete(key);
         if (this.cache.size >= this.maxSize) {
             // Evict oldest (first key in iteration)
             const oldestKey = this.cache.keys().next().value;

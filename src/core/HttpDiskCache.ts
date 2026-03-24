@@ -19,6 +19,8 @@ export interface HttpCacheEntry {
 }
 
 export class HttpDiskCache {
+    private pruning = false;
+
     constructor(private readonly options: HttpDiskCacheOptions) {}
 
     private async ensureDir(): Promise<void> {
@@ -37,18 +39,34 @@ export class HttpDiskCache {
         return path.join(this.options.dir, `${this.key(url)}.body.txt`);
     }
 
+    private isValidEntry(parsed: unknown): parsed is HttpCacheEntry {
+        if (parsed === null || typeof parsed !== 'object') return false;
+        const p = parsed as Record<string, unknown>;
+        return (
+            typeof p.ts === 'number' &&
+            typeof p.url === 'string' &&
+            typeof p.status === 'number' &&
+            typeof p.bodyFile === 'string' &&
+            p.headers !== null &&
+            typeof p.headers === 'object'
+        );
+    }
+
     async get(url: string): Promise<{ entry: HttpCacheEntry; body: string } | null> {
         await this.ensureDir();
         const meta = this.metaPath(url);
         try {
             const raw = await fs.readFile(meta, 'utf-8');
-            const entry = JSON.parse(raw) as HttpCacheEntry;
-            if (!entry || typeof entry.ts !== 'number') return null;
+            const parsed: unknown = JSON.parse(raw);
+            if (!this.isValidEntry(parsed)) return null;
+            const entry = parsed;
             if (Date.now() - entry.ts > this.options.ttlMs) {
                 await this.delete(url).catch(() => {});
                 return null;
             }
-            const body = await fs.readFile(path.join(this.options.dir, entry.bodyFile), 'utf-8');
+            // Sanitize bodyFile to prevent path traversal from tampered cache entries
+            const safeBodyFile = path.basename(entry.bodyFile);
+            const body = await fs.readFile(path.join(this.options.dir, safeBodyFile), 'utf-8');
             return { entry, body };
         } catch {
             return null;
@@ -76,10 +94,20 @@ export class HttpDiskCache {
             bodyFile,
         };
 
-        await fs.writeFile(tmpBody, body, 'utf-8');
-        await fs.rename(tmpBody, bodyFilePath);
-        await fs.writeFile(tmpMeta, JSON.stringify(entry), 'utf-8');
-        await fs.rename(tmpMeta, metaFile);
+        try {
+            await fs.writeFile(tmpBody, body, 'utf-8');
+            await fs.rename(tmpBody, bodyFilePath);
+        } catch (e) {
+            await fs.unlink(tmpBody).catch(() => {});
+            throw e;
+        }
+        try {
+            await fs.writeFile(tmpMeta, JSON.stringify(entry), 'utf-8');
+            await fs.rename(tmpMeta, metaFile);
+        } catch (e) {
+            await fs.unlink(tmpMeta).catch(() => {});
+            throw e;
+        }
 
         await this.prune().catch(() => {});
     }
@@ -92,17 +120,33 @@ export class HttpDiskCache {
     }
 
     private async prune(): Promise<void> {
+        if (this.pruning) return;
+        this.pruning = true;
+        try {
+            await this.pruneImpl();
+        } finally {
+            this.pruning = false;
+        }
+    }
+
+    private async pruneImpl(): Promise<void> {
         const entries = await fs.readdir(this.options.dir, { withFileTypes: true });
         const metas = entries.filter((e) => e.isFile() && e.name.endsWith('.meta.json'));
         if (metas.length <= this.options.maxEntries) return;
 
-        const stats = await Promise.all(
+        const statResults = await Promise.all(
             metas.map(async (e) => {
                 const p = path.join(this.options.dir, e.name);
-                const st = await fs.stat(p);
-                return { p, mtimeMs: st.mtimeMs };
+                try {
+                    const st = await fs.stat(p);
+                    return { p, mtimeMs: st.mtimeMs };
+                } catch {
+                    return null; // File deleted between readdir and stat
+                }
             })
         );
+        const stats = statResults.filter((s): s is NonNullable<typeof s> => s !== null);
+        if (stats.length <= this.options.maxEntries) return;
         stats.sort((a, b) => a.mtimeMs - b.mtimeMs);
 
         const toDelete = stats.slice(0, Math.max(0, stats.length - this.options.maxEntries));
@@ -113,7 +157,7 @@ export class HttpDiskCache {
                     const entry = JSON.parse(raw) as HttpCacheEntry;
                     await fs.unlink(f.p).catch(() => {});
                     if (entry?.bodyFile) {
-                        await fs.unlink(path.join(this.options.dir, entry.bodyFile)).catch(() => {});
+                        await fs.unlink(path.join(this.options.dir, path.basename(entry.bodyFile))).catch(() => {});
                     }
                 } catch {
                     await fs.unlink(f.p).catch(() => {});
