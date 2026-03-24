@@ -4,14 +4,15 @@ function approxTokens(text: string): number {
     return Math.max(1, Math.ceil(text.length / 4));
 }
 
-function slugify(input: string): string {
-    return input
+function slugify(input: string): string | undefined {
+    const result = input
         .toLowerCase()
         .trim()
         .replace(/[^\w\s-]/g, '')
         .replace(/\s+/g, '-')
         .replace(/-+/g, '-')
         .slice(0, 80);
+    return result || undefined; // Return undefined instead of empty string
 }
 
 export interface ChunkerOptions {
@@ -51,9 +52,13 @@ export function chunkMarkdown(markdown: string, options: ChunkerOptions): Conten
     }
     flush();
 
-    const maxTokens = Math.max(50, options.maxTokens);
-    const overlapChars = Math.max(0, options.overlapTokens) * 4;
+    const maxTokens = Math.max(50, Number.isFinite(options.maxTokens) ? options.maxTokens : 1200);
+    const maxChars = maxTokens * 4;
+    // Clamp overlap to less than maxTokens to prevent oversized chunks
+    const rawOverlap = Math.max(0, Number.isFinite(options.overlapTokens) ? options.overlapTokens : 0);
+    const overlapChars = Math.min(rawOverlap, Math.floor(maxTokens * 0.5)) * 4;
 
+    const MAX_CHUNKS = 10_000;
     const chunks: ContentChunk[] = [];
     let buf = '';
     let bufPath: string[] = [];
@@ -61,12 +66,14 @@ export function chunkMarkdown(markdown: string, options: ChunkerOptions): Conten
 
     const emitText = (text: string, path: string[]) => {
         text = text.trim();
-        if (!text) return;
+        if (!text || chunks.length >= MAX_CHUNKS) return;
+        // Snapshot path so chunks don't share a mutable reference
+        const safePath = [...path];
 
         // If text still exceeds maxChars, split at word/sentence boundaries
         if (text.length > maxChars) {
             let remaining = text;
-            while (remaining.length > maxChars) {
+            while (remaining.length > maxChars && chunks.length < MAX_CHUNKS) {
                 // Find a split point: prefer sentence end, then word boundary
                 let splitAt = maxChars;
                 const sentenceEnd = remaining.lastIndexOf('. ', maxChars);
@@ -81,30 +88,30 @@ export function chunkMarkdown(markdown: string, options: ChunkerOptions): Conten
                 const piece = remaining.slice(0, splitAt).trim();
                 if (piece) {
                     const id = `chunk_${chunks.length + 1}`;
-                    const anchorHeading = path.length ? path[path.length - 1] : '';
+                    const anchorHeading = safePath.length ? safePath[safePath.length - 1] : '';
                     const anchor = anchorHeading ? slugify(anchorHeading) : undefined;
-                    chunks.push({ id, text: piece, approxTokens: approxTokens(piece), headingPath: path, citation: { url: options.url, anchor } });
+                    chunks.push({ id, text: piece, approxTokens: approxTokens(piece), headingPath: safePath, citation: { url: options.url, anchor } });
                 }
                 remaining = remaining.slice(splitAt).trim();
             }
-            if (remaining) {
+            if (remaining && chunks.length < MAX_CHUNKS) {
                 const id = `chunk_${chunks.length + 1}`;
-                const anchorHeading = path.length ? path[path.length - 1] : '';
+                const anchorHeading = safePath.length ? safePath[safePath.length - 1] : '';
                 const anchor = anchorHeading ? slugify(anchorHeading) : undefined;
-                chunks.push({ id, text: remaining, approxTokens: approxTokens(remaining), headingPath: path, citation: { url: options.url, anchor } });
+                chunks.push({ id, text: remaining, approxTokens: approxTokens(remaining), headingPath: safePath, citation: { url: options.url, anchor } });
                 lastChunkTail = overlapChars > 0 ? remaining.slice(Math.max(0, remaining.length - overlapChars)) : '';
             }
             return;
         }
 
         const id = `chunk_${chunks.length + 1}`;
-        const anchorHeading = path.length ? path[path.length - 1] : '';
+        const anchorHeading = safePath.length ? safePath[safePath.length - 1] : '';
         const anchor = anchorHeading ? slugify(anchorHeading) : undefined;
         chunks.push({
             id,
             text,
             approxTokens: approxTokens(text),
-            headingPath: path,
+            headingPath: safePath,
             citation: { url: options.url, anchor },
         });
         lastChunkTail = overlapChars > 0 ? text.slice(Math.max(0, text.length - overlapChars)) : '';
@@ -114,8 +121,6 @@ export function chunkMarkdown(markdown: string, options: ChunkerOptions): Conten
         emitText(buf, bufPath);
         buf = '';
     };
-
-    const maxChars = maxTokens * 4;
 
     for (const block of blocks) {
         const candidate = (buf ? `${buf}\n\n${block.text}` : block.text).trim();
@@ -146,7 +151,9 @@ export function chunkMarkdown(markdown: string, options: ChunkerOptions): Conten
             buf = lineBuf.trim();
             bufPath = block.headingPath;
         } else {
-            buf = (lastChunkTail ? `${lastChunkTail}\n\n${block.text}` : block.text).trim();
+            const withOverlap = lastChunkTail ? `${lastChunkTail}\n\n${block.text}` : block.text;
+            // If overlap pushes over limit, drop it to avoid oversized chunks
+            buf = (withOverlap.length > maxChars && lastChunkTail ? block.text : withOverlap).trim();
             bufPath = block.headingPath;
         }
     }

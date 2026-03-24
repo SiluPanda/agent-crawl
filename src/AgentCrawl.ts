@@ -3,12 +3,12 @@ import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
 import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig } from './types.js';
-import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog } from './core/UrlUtils.js';
+import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog, isPrivateHost } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
 import { HostScheduler } from './core/HostScheduler.js';
 import { DiskKv } from './core/DiskKv.js';
 import { chunkMarkdown } from './core/Chunker.js';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
@@ -35,6 +35,8 @@ export class AgentCrawl {
     private static markdownifier = new Markdownifier();
     private static browserManager = BrowserManager.getInstance();
     private static cache = new CacheManager();
+    private static diskCacheInstances = new Map<string, DiskKv<any>>();
+    private static readonly MAX_CACHE_INSTANCES = 50;
 
     private static normalizeUrlForDedupe(input: string): string {
         try {
@@ -49,16 +51,18 @@ export class AgentCrawl {
      * Generate a cache key from URL and config
      */
     private static getCacheKey(url: string, config: NormalizedScrapeConfig): string {
+        // Use \0 as separator — can't appear in URLs or CSS selectors, preventing
+        // cache key collisions when field values contain the separator character.
         const parts = [
             url,
             config.mode,
-            config.extractMainContent ? 'main' : 'full',
-            config.optimizeTokens ? 'optimized' : 'raw',
-            config.stealth ? 'stealth' : 'no-stealth',
+            config.extractMainContent ? '1' : '0',
+            config.optimizeTokens ? '1' : '0',
+            config.stealth ? '1' : '0',
             config.stealthLevel,
             config.waitFor || '',
         ];
-        return parts.join(':');
+        return parts.join('\0');
     }
 
     private static normalizeScrapeConfig(config: ScrapeConfig = {}): NormalizedScrapeConfig {
@@ -78,24 +82,49 @@ export class AgentCrawl {
         };
     }
 
+    /** Reject directory traversal in user-supplied dir configs. */
+    private static safeCacheDir(dir: string): string {
+        // Reject path traversal via .. segments
+        const segments = dir.split(/[\\/]/);
+        if (segments.some(s => s === '..')) {
+            throw new Error(`Path traversal not allowed in cache dir: ${dir.slice(0, 100)}`);
+        }
+        return dir;
+    }
+
     private static diskCacheFromConfig<T>(cfg: boolean | DiskCacheConfig | undefined, subdir: string): DiskKv<T> | null {
         if (!cfg) return null;
         const c = typeof cfg === 'boolean' ? {} : cfg;
         const enabled = c.enabled ?? true;
         if (!enabled) return null;
-        const dir = c.dir ?? '.cache/agent-crawl';
+        const dir = this.safeCacheDir(c.dir ?? '.cache/agent-crawl');
         const ttlMs = c.ttlMs ?? 5 * 60_000;
         const maxEntries = c.maxEntries ?? 1000;
-        return new DiskKv<T>({ dir: path.join(dir, subdir), ttlMs, maxEntries });
+        const fullDir = path.join(dir, subdir);
+        // Reuse instances with the same config to avoid redundant mkdir and pruning resets
+        const cacheKey = `${fullDir}:${ttlMs}:${maxEntries}`;
+        let instance = this.diskCacheInstances.get(cacheKey) as DiskKv<T> | undefined;
+        if (!instance) {
+            // Evict oldest entry if map is at capacity to prevent unbounded growth
+            if (this.diskCacheInstances.size >= this.MAX_CACHE_INSTANCES) {
+                const oldestKey = this.diskCacheInstances.keys().next().value;
+                if (oldestKey) this.diskCacheInstances.delete(oldestKey);
+            }
+            instance = new DiskKv<T>({ dir: fullDir, ttlMs, maxEntries });
+            this.diskCacheInstances.set(cacheKey, instance);
+        }
+        return instance;
     }
 
     private static crawlStatePath(startUrl: string, cfg: CrawlStateConfig): string {
-        const dir = cfg.dir ?? '.cache/agent-crawl/state';
+        const dir = this.safeCacheDir(cfg.dir ?? '.cache/agent-crawl/state');
         const rawId = cfg.id ?? createHash('sha256').update(startUrl).digest('hex').slice(0, 16);
         // Sanitize id to prevent path traversal — allow only alphanumeric, hyphens, underscores
         const id = rawId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
         return path.join(dir, `${id}.json`);
     }
+
+    private static readonly MAX_ERROR_LENGTH = 500;
 
     private static toErrorPage(
         url: string,
@@ -104,23 +133,49 @@ export class AgentCrawl {
         headers: Record<string, string> = {}
     ): ScrapedPage {
         return {
-            url,
+            url: url.length > 2048 ? url.slice(0, 2048) : url,
             content: '',
             title: '',
             metadata: {
                 status,
-                error,
+                error: error.length > this.MAX_ERROR_LENGTH
+                    ? error.slice(0, this.MAX_ERROR_LENGTH) + '...'
+                    : error,
                 responseHeaders: headers,
             },
         };
     }
 
+    private static readonly MAX_URL_LENGTH = 8192;
+
     static async scrape(url: string, config: ScrapeConfig = {}): Promise<ScrapedPage> {
+        // Reject excessively long URLs before any processing
+        if (url.length > this.MAX_URL_LENGTH) {
+            return this.toErrorPage(url.slice(0, 200), `URL too long (${url.length} chars, max ${this.MAX_URL_LENGTH})`);
+        }
+
+        // Validate URL upfront before any cache I/O or network activity
+        try {
+            const parsed = new URL(url);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return this.toErrorPage(url, `Non-HTTP protocol not supported: ${parsed.protocol}`);
+            }
+            // SSRF defense-in-depth: reject private/internal hosts before any I/O
+            if (isPrivateHost(parsed.hostname)) {
+                return this.toErrorPage(url, 'Request to private/internal host blocked');
+            }
+        } catch {
+            return this.toErrorPage(url, 'Invalid URL');
+        }
+
         const normalizedConfig = this.normalizeScrapeConfig(config);
         const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking } = normalizedConfig;
 
+        // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
+        const normalizedUrl = this.normalizeUrlForDedupe(url);
+
         // Check Cache first to avoid unnecessary network requests
-        const cacheKey = this.getCacheKey(url, normalizedConfig);
+        const cacheKey = this.getCacheKey(normalizedUrl, normalizedConfig);
         const cached = this.cache.get(cacheKey);
         if (cached) {
             return cached;
@@ -185,8 +240,11 @@ export class AgentCrawl {
                     return this.toErrorPage(url, `Browser fetch returned HTTP ${status}`, status, headers);
                 }
             } catch (e: any) {
-                console.error(`Browser scrape failed for ${sanitizeUrlForLog(url)}: ${e.message}`);
-                return this.toErrorPage(url, `Browser scrape failed: ${e.message}`, 0, headers);
+                const rawMsg = e instanceof Error ? e.message : String(e);
+                // Strip filesystem paths from Playwright errors before exposing to caller
+                const msg = rawMsg.replace(/(?:\/[\w.-]+){2,}/g, '[path]');
+                console.error(`Browser scrape failed for ${sanitizeUrlForLog(url)}: ${rawMsg}`);
+                return this.toErrorPage(url, `Browser scrape failed: ${msg}`, 0, headers);
             }
         }
 
@@ -250,11 +308,18 @@ export class AgentCrawl {
      * Crawl a website starting from the given URL.
      * Uses BFS traversal with configurable depth, page limit, and concurrency.
      */
+    /** Coerce to a finite number or return the fallback. Prevents NaN propagation from unvalidated config. */
+    private static finiteOr(value: number | undefined, fallback: number): number {
+        if (value === undefined || value === null) return fallback;
+        const n = Number(value);
+        return Number.isFinite(n) ? n : fallback;
+    }
+
     static async crawl(startUrl: string, config: CrawlConfig = {}): Promise<CrawlResult> {
-        const maxDepth = config.maxDepth ?? 1;
-        const maxPages = config.maxPages ?? 10;
-        const concurrency = config.concurrency ?? 2;
-        const perHostConcurrency = config.perHostConcurrency ?? concurrency;
+        const maxDepth = Math.min(Math.max(0, this.finiteOr(config.maxDepth, 1)), 100);
+        const maxPages = Math.min(Math.max(1, this.finiteOr(config.maxPages, 10)), 100_000);
+        const concurrency = Math.min(Math.max(1, this.finiteOr(config.concurrency, 2)), 50);
+        const perHostConcurrency = Math.min(Math.max(1, this.finiteOr(config.perHostConcurrency, concurrency)), concurrency);
         const includePatterns = config.includePatterns ?? [];
         const excludePatterns = config.excludePatterns ?? [];
 
@@ -265,7 +330,7 @@ export class AgentCrawl {
 
         const sitemapCfg = typeof config.sitemap === 'boolean' ? { enabled: config.sitemap } : (config.sitemap ?? {});
         const sitemapEnabled = sitemapCfg.enabled === true;
-        const sitemapMaxUrls = sitemapCfg.maxUrls ?? 1000;
+        const sitemapMaxUrls = this.finiteOr(sitemapCfg.maxUrls, 1000);
 
         const stateCfg0 = typeof config.crawlState === 'boolean' ? { enabled: config.crawlState } : (config.crawlState ?? {});
         const stateEnabled = stateCfg0.enabled === true;
@@ -274,7 +339,7 @@ export class AgentCrawl {
             dir: stateCfg0.dir,
             id: stateCfg0.id,
             resume: stateCfg0.resume ?? true,
-            flushEvery: stateCfg0.flushEvery ?? 10,
+            flushEvery: Math.max(1, this.finiteOr(stateCfg0.flushEvery, 10)),
             persistPages: stateCfg0.persistPages ?? true,
         };
 
@@ -292,10 +357,37 @@ export class AgentCrawl {
             chunking: config.chunking,
         };
 
+        // Reject excessively long start URLs before any processing
+        if (startUrl.length > this.MAX_URL_LENGTH) {
+            return {
+                pages: [],
+                totalPages: 0,
+                maxDepthReached: 0,
+                errors: [{ url: startUrl.slice(0, 200), error: `URL too long (${startUrl.length} chars, max ${this.MAX_URL_LENGTH})` }],
+            };
+        }
+
         // Normalize start URL and get base origin for same-origin filtering
         let baseOrigin: string;
         try {
             const parsed = new URL(startUrl);
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return {
+                    pages: [],
+                    totalPages: 0,
+                    maxDepthReached: 0,
+                    errors: [{ url: startUrl, error: `Non-HTTP protocol not supported: ${parsed.protocol}` }],
+                };
+            }
+            // SSRF: reject private/internal hosts upfront with a clear error
+            if (isPrivateHost(parsed.hostname)) {
+                return {
+                    pages: [],
+                    totalPages: 0,
+                    maxDepthReached: 0,
+                    errors: [{ url: startUrl, error: 'Crawling private/internal hosts is not allowed' }],
+                };
+            }
             baseOrigin = parsed.origin;
             startUrl = normalizeUrl(parsed.href);
         } catch {
@@ -312,7 +404,7 @@ export class AgentCrawl {
             robots = await fetchRobotsTxt(baseOrigin, robotsUserAgent);
         }
         const robotsCrawlDelayMs = (respectCrawlDelay && robots?.rules.crawlDelayMs) ? robots.rules.crawlDelayMs : 0;
-        const effectiveMinDelay = Math.max(config.minDelayMs ?? 0, robotsCrawlDelayMs);
+        const effectiveMinDelay = Math.max(this.finiteOr(config.minDelayMs, 0), robotsCrawlDelayMs);
         const scheduler = new HostScheduler(perHostConcurrency, effectiveMinDelay);
 
         const matchesPatterns = (url: string): boolean => {
@@ -324,28 +416,59 @@ export class AgentCrawl {
             return true;
         };
 
+        const MAX_QUEUED_URL_LENGTH = 8192;
         const shouldQueue = (absoluteUrl: string): boolean => {
-            if (!absoluteUrl.startsWith(baseOrigin)) return false;
-            const u = safeHttpUrl(absoluteUrl);
+            if (absoluteUrl.length > MAX_QUEUED_URL_LENGTH) return false;
+            const u = safeHttpUrl(absoluteUrl, { allowPrivate: false });
             if (!u) return false;
+            // Same-origin check via parsed origin, NOT string prefix
+            // (startsWith is fooled by userinfo: example.com@evil.com)
+            if (u.origin !== baseOrigin) return false;
             if (!matchesPatterns(absoluteUrl)) return false;
             if (robotsEnabled && robots && !isAllowedByRobots(absoluteUrl, robots)) return false;
             return true;
         };
 
-        // Cap queue size to prevent memory exhaustion on link-heavy sites
-        const maxQueueSize = Math.max(maxPages * 20, 10_000);
+        // Cap queue and set sizes to prevent memory exhaustion on link-heavy sites
+        const maxQueueSize = Math.min(Math.max(maxPages * 20, 10_000), 500_000);
+        const maxVisitedSize = maxQueueSize * 2;
 
         const visited = new Set<string>();
         const queued = new Set<string>();
         const pages: ScrapedPage[] = [];
         const errors: Array<{ url: string; error: string }> = [];
+        const maxErrors = maxPages * 2; // Cap errors to prevent unbounded growth
         let maxDepthReached = 0;
 
-        const queue: Array<{ url: string; depth: number }> = [];
+        const MAX_STATE_BYTES = 100 * 1024 * 1024; // 100MB cap for state file
+        const MAX_RESTORED_CONTENT_LENGTH = 5 * 1024 * 1024; // 5MB cap per restored page content
+        let queue: Array<{ url: string; depth: number }> = [];
         const statePath = stateEnabled ? this.crawlStatePath(startUrl, stateCfg) : null;
+        // Clean up stale .tmp files from crashed writes in the state directory
+        if (stateEnabled && statePath) {
+            try {
+                const stateDir = path.dirname(statePath);
+                const dirEntries = await fs.readdir(stateDir).catch(() => [] as string[]);
+                for (const entry of dirEntries) {
+                    if (entry.endsWith('.tmp')) {
+                        const tmpPath = path.join(stateDir, entry);
+                        try {
+                            const st = await fs.stat(tmpPath);
+                            if (Date.now() - st.mtimeMs > 5 * 60_000) {
+                                await fs.unlink(tmpPath).catch(() => {});
+                            }
+                        } catch { /* already deleted */ }
+                    }
+                }
+            } catch { /* state dir may not exist yet */ }
+        }
         if (stateEnabled && stateCfg.resume && statePath) {
             try {
+                const stat = await fs.stat(statePath);
+                if (stat.size > MAX_STATE_BYTES) {
+                    console.warn('[AgentCrawl] State file too large, skipping resume');
+                    throw new Error('State file too large');
+                }
                 const raw = await fs.readFile(statePath, 'utf-8');
                 const parsed = JSON.parse(raw) as any;
                 if (
@@ -355,28 +478,46 @@ export class AgentCrawl {
                     Array.isArray(parsed?.queued)
                 ) {
                     for (const u of parsed.visited) {
-                        if (typeof u === 'string') visited.add(u);
+                        if (typeof u === 'string' && u.length <= MAX_QUEUED_URL_LENGTH && visited.size < maxVisitedSize) visited.add(u);
                     }
                     // Skip loading parsed.queued into the queued set — stale entries
                     // would permanently block organic link discovery.
                     // The re-validation loop below adds valid items to both queue and queued.
                     if (stateCfg.persistPages && Array.isArray(parsed.pages)) {
                         for (const p of parsed.pages) {
-                            if (p && typeof p.url === 'string' && typeof p.content === 'string') {
+                            if (pages.length >= maxPages) break;
+                            if (
+                                p && typeof p === 'object' && !Array.isArray(p) &&
+                                typeof p.url === 'string' && p.url.length <= MAX_QUEUED_URL_LENGTH &&
+                                typeof p.content === 'string' && p.content.length <= MAX_RESTORED_CONTENT_LENGTH &&
+                                (p.title === undefined || (typeof p.title === 'string' && p.title.length <= 10_000)) &&
+                                (p.links === undefined || (Array.isArray(p.links) && p.links.length <= 10_000
+                                    && p.links.every((l: unknown) => typeof l === 'string' && l.length <= MAX_QUEUED_URL_LENGTH))) &&
+                                (p.metadata === undefined || (typeof p.metadata === 'object' && !Array.isArray(p.metadata)))
+                            ) {
+                                // Re-validate URL origin matches the crawl base origin
+                                try {
+                                    const pageOrigin = new URL(p.url).origin;
+                                    if (pageOrigin !== baseOrigin) continue;
+                                } catch { continue; }
                                 pages.push(p as ScrapedPage);
                             }
                         }
                     }
                     if (Array.isArray(parsed.errors)) {
                         for (const e of parsed.errors) {
-                            if (e && typeof e.url === 'string' && typeof e.error === 'string') {
+                            if (errors.length >= maxErrors) break;
+                            if (e && typeof e.url === 'string' && e.url.length <= MAX_QUEUED_URL_LENGTH
+                                && typeof e.error === 'string' && e.error.length <= 1000) {
                                 errors.push(e);
                             }
                         }
                     }
-                    maxDepthReached = typeof parsed.maxDepthReached === 'number' ? parsed.maxDepthReached : 0;
+                    maxDepthReached = typeof parsed.maxDepthReached === 'number' && Number.isFinite(parsed.maxDepthReached) && parsed.maxDepthReached >= 0
+                        ? Math.min(parsed.maxDepthReached, maxDepth) : 0;
                     for (const item of parsed.queue) {
-                        if (typeof item?.url === 'string' && typeof item?.depth === 'number') {
+                        if (typeof item?.url === 'string' && typeof item?.depth === 'number'
+                            && Number.isFinite(item.depth) && item.depth >= 0) {
                             // Re-validate restored items against current robots.txt, patterns, and origin
                             if (!visited.has(item.url) && shouldQueue(item.url) && item.depth <= maxDepth) {
                                 queue.push(item);
@@ -385,17 +526,21 @@ export class AgentCrawl {
                         }
                     }
                 }
-            } catch {
-                // ignore resume failures
+            } catch (e) {
+                console.warn(`[AgentCrawl] Failed to resume crawl state from ${statePath}: ${e instanceof Error ? e.message : String(e)}`);
             }
         }
 
-        // BFS queue: { url, depth }
+        // BFS queue: { url, depth } — use index cursor instead of shift() for O(1) dequeue
+        let queueHead = 0;
         const normalizedStartUrl = this.normalizeUrlForDedupe(startUrl);
         if (shouldQueue(normalizedStartUrl)) {
             if (!queued.has(normalizedStartUrl) && !visited.has(normalizedStartUrl)) {
                 queue.push({ url: normalizedStartUrl, depth: 0 });
             }
+        } else if (!visited.has(normalizedStartUrl)) {
+            // Start URL failed pattern/robots filters — report so the caller knows
+            errors.push({ url: normalizedStartUrl, error: 'Start URL excluded by includePatterns, excludePatterns, or robots.txt' });
         }
         queued.add(normalizedStartUrl);
 
@@ -404,9 +549,11 @@ export class AgentCrawl {
             try {
                 const res = await this.fetcher.fetch(sitemapUrl, { retries: 0, timeout: 10000, maxResponseBytes: 2_000_000, httpCache: config.httpCache });
                 if (res.status >= 200 && res.status < 300 && res.html) {
-                    const locs = Array.from(res.html.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)).map((m) => m[1]);
+                    const decodeXmlEntities = (s: string) =>
+                        s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+                    const locs = Array.from(res.html.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)).map((m) => decodeXmlEntities(m[1]));
                     for (const loc of locs.slice(0, sitemapMaxUrls)) {
-                        if (queue.length >= maxQueueSize) break;
+                        if ((queue.length - queueHead) >= maxQueueSize) break;
                         const normalized = this.normalizeUrlForDedupe(loc);
                         if (shouldQueue(normalized) && !queued.has(normalized) && !visited.has(normalized)) {
                             queue.push({ url: normalized, depth: 0 });
@@ -419,58 +566,66 @@ export class AgentCrawl {
             }
         }
 
-        const MAX_STATE_BYTES = 100 * 1024 * 1024; // 100MB cap for state file
+        let persistingState = false;
         const persistState = async () => {
             if (!stateEnabled || !statePath) return;
-            await fs.mkdir(path.dirname(statePath), { recursive: true }).catch(() => {});
-            const tmp = `${statePath}.tmp`;
-            const payload = {
-                version: 1,
-                startUrl,
-                baseOrigin,
-                queue,
-                visited: Array.from(visited),
-                queued: Array.from(queued),
-                pages: stateCfg.persistPages ? pages : [],
-                errors,
-                maxDepthReached,
-                updatedAt: Date.now(),
-            };
-            let json: string;
+            if (persistingState) return; // Prevent concurrent writes
+            persistingState = true;
             try {
-                json = JSON.stringify(payload);
-            } catch {
-                // JSON.stringify can throw on circular refs or exceed string limits
-                return;
-            }
-            if (json.length > MAX_STATE_BYTES) {
-                // Retry without pages to stay within the size cap
-                payload.pages = [];
-                try { json = JSON.stringify(payload); } catch { return; }
-            }
-            try {
-                await fs.writeFile(tmp, json, 'utf-8');
-                await fs.rename(tmp, statePath);
-            } catch (e) {
-                await fs.unlink(tmp).catch(() => {});
-                throw e;
+                await fs.mkdir(path.dirname(statePath), { recursive: true }).catch(() => {});
+                const tmp = `${statePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+                const payload = {
+                    version: 1,
+                    startUrl,
+                    baseOrigin,
+                    queue: queue.slice(queueHead),
+                    visited: Array.from(visited),
+                    queued: Array.from(queued),
+                    pages: stateCfg.persistPages ? pages : [],
+                    errors,
+                    maxDepthReached,
+                    updatedAt: Date.now(),
+                };
+                let json: string;
+                try {
+                    json = JSON.stringify(payload);
+                } catch {
+                    return;
+                }
+                if (json.length > MAX_STATE_BYTES) {
+                    payload.pages = [];
+                    try { json = JSON.stringify(payload); } catch { return; }
+                }
+                try {
+                    await fs.writeFile(tmp, json, 'utf-8');
+                    await fs.rename(tmp, statePath);
+                } catch {
+                    await fs.unlink(tmp).catch(() => {});
+                }
+            } finally {
+                persistingState = false;
             }
         };
 
         let batches = 0;
-        while (queue.length > 0 && pages.length < maxPages) {
+        while (queueHead < queue.length && pages.length < maxPages) {
             // Take a batch of URLs up to concurrency limit
             const batch: Array<{ url: string; depth: number }> = [];
-            while (batch.length < concurrency && queue.length > 0 && (pages.length + batch.length) < maxPages) {
-                const item = queue.shift()!;
+            while (batch.length < concurrency && queueHead < queue.length && (pages.length + batch.length) < maxPages) {
+                const item = queue[queueHead++];
                 queued.delete(item.url);
 
-                // Skip if already visited or exceeds max depth
-                if (visited.has(item.url) || item.depth > maxDepth) {
+                // Skip if already visited
+                if (visited.has(item.url)) {
                     continue;
                 }
 
+                // Mark as visited even when over maxDepth to prevent re-queuing waste
                 visited.add(item.url);
+
+                if (item.depth > maxDepth) {
+                    continue;
+                }
                 batch.push(item);
             }
 
@@ -502,13 +657,15 @@ export class AgentCrawl {
 
                     // Successful scrape if no explicit metadata error
                     if (!page.metadata?.error) {
+                        if (pages.length >= maxPages) continue;
                         pages.push(page);
                         maxDepthReached = Math.max(maxDepthReached, depth);
 
                         // Add discovered links to queue (if not at max depth)
                         if (depth < maxDepth && page.links) {
                             for (const link of page.links) {
-                                if (queue.length >= maxQueueSize) break;
+                                if ((queue.length - queueHead) >= maxQueueSize) break;
+                                if (visited.size >= maxVisitedSize) break;
                                 const normalizedLink = this.normalizeUrlForDedupe(link);
                                 // Only add same-origin links that aren't visited or already queued
                                 if (shouldQueue(normalizedLink) && !visited.has(normalizedLink) && !queued.has(normalizedLink)) {
@@ -518,15 +675,29 @@ export class AgentCrawl {
                             }
                         }
                     } else {
-                        errors.push({ url, error: page.metadata?.error || 'Unknown error' });
+                        if (errors.length < maxErrors) {
+                            const errMsg = page.metadata?.error || 'Unknown error';
+                            errors.push({ url, error: typeof errMsg === 'string' && errMsg.length > this.MAX_ERROR_LENGTH ? errMsg.slice(0, this.MAX_ERROR_LENGTH) + '...' : String(errMsg) });
+                        }
                     }
                 } else {
-                    errors.push({ url, error: result.reason?.message || 'Failed to scrape' });
+                    if (errors.length < maxErrors) {
+                        const rawMsg = result.reason?.message || 'Failed to scrape';
+                        errors.push({ url, error: rawMsg.length > this.MAX_ERROR_LENGTH ? rawMsg.slice(0, this.MAX_ERROR_LENGTH) + '...' : rawMsg });
+                    }
                 }
             }
 
             batches++;
-            if (stateEnabled && (batches % (stateCfg.flushEvery ?? 10) === 0)) {
+
+            // Compact the queue array periodically to release consumed entries.
+            // Use slice (creates new array for GC) instead of splice (O(n) in-place shift).
+            if (queueHead > 10_000) {
+                queue = queue.slice(queueHead);
+                queueHead = 0;
+            }
+
+            if (stateEnabled && (batches % stateCfg.flushEvery! === 0)) {
                 await persistState().catch(() => {});
             }
         }
@@ -549,6 +720,6 @@ export class AgentCrawl {
      * to ensure the process can exit immediately.
      */
     static async close(): Promise<void> {
-        await this.browserManager.close();
+        await this.browserManager.close(true);
     }
 }

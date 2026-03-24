@@ -1,55 +1,61 @@
 import { z } from 'zod';
 
+/** Reusable dir validator: rejects path traversal via ".." segments */
+const safeDir = z.string().max(500).refine(
+    (dir) => !dir.split(/[\\/]/).some(s => s === '..'),
+    { message: 'Path traversal ("..") not allowed in directory paths' },
+);
+
 export const ScrapeOptionsSchema = z.object({
-    url: z.string().url(),
+    url: z.string().url().max(8192),
     mode: z.enum(['static', 'hybrid', 'browser']).default('hybrid'),
-    waitFor: z.string().optional().describe('CSS selector to wait for (browser mode only)'),
+    waitFor: z.string().max(500).optional().describe('CSS selector to wait for (browser mode only, max 500 chars)'),
     extractMainContent: z.boolean().default(false).describe('Extract only main content using Readability-like algorithm'),
     optimizeTokens: z.boolean().default(true).describe('Optimize markdown output for token efficiency'),
     stealth: z.boolean().default(false).describe('Apply best-effort browser stealth hardening (browser mode only)'),
     stealthLevel: z.enum(['basic', 'balanced']).default('balanced').describe('Stealth profile level when stealth is enabled'),
-    maxResponseBytes: z.number().int().min(1).optional().describe('Maximum static fetch response size in bytes (best-effort)'),
+    maxResponseBytes: z.number().int().min(1).max(50 * 1024 * 1024).optional().describe('Maximum static fetch response size in bytes (best-effort, max 50MB)'),
     cache: z.union([
         z.boolean(),
         z.object({
             enabled: z.boolean().optional(),
-            dir: z.string().optional(),
-            ttlMs: z.number().int().min(1).optional(),
-            maxEntries: z.number().int().min(1).optional(),
+            dir: safeDir.optional(),
+            ttlMs: z.number().int().min(1).max(7 * 24 * 60 * 60_000).optional(),
+            maxEntries: z.number().int().min(1).max(100_000).optional(),
         }),
     ]).optional().describe('Opt-in disk cache for processed scrape results'),
     httpCache: z.union([
         z.boolean(),
         z.object({
             enabled: z.boolean().optional(),
-            dir: z.string().optional(),
-            ttlMs: z.number().int().min(1).optional(),
-            maxEntries: z.number().int().min(1).optional(),
+            dir: safeDir.optional(),
+            ttlMs: z.number().int().min(1).max(7 * 24 * 60 * 60_000).optional(),
+            maxEntries: z.number().int().min(1).max(100_000).optional(),
         }),
     ]).optional().describe('Opt-in disk HTTP cache for static fetches (ETag/Last-Modified)'),
     chunking: z.union([
         z.boolean(),
         z.object({
             enabled: z.boolean().optional(),
-            maxTokens: z.number().int().min(1).optional(),
-            overlapTokens: z.number().int().min(0).optional(),
+            maxTokens: z.number().int().min(1).max(100_000).optional(),
+            overlapTokens: z.number().int().min(0).max(50_000).optional(),
         }),
     ]).optional().describe('Opt-in token-aware chunking with citation anchors'),
 });
 
 export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({
-    maxDepth: z.number().int().min(0).default(1),
-    maxPages: z.number().int().min(1).default(10),
-    concurrency: z.number().int().min(1).default(2),
-    perHostConcurrency: z.number().int().min(1).optional().describe('Maximum concurrent requests per host (defaults to concurrency)'),
-    minDelayMs: z.number().int().min(0).optional().describe('Minimum delay between requests to the same host (ms)'),
-    includePatterns: z.array(z.string()).optional().describe('Only crawl URLs matching any of these patterns'),
-    excludePatterns: z.array(z.string()).optional().describe('Do not crawl URLs matching any of these patterns'),
+    maxDepth: z.number().int().min(0).max(100).default(1),
+    maxPages: z.number().int().min(1).max(100_000).default(10),
+    concurrency: z.number().int().min(1).max(50).default(2),
+    perHostConcurrency: z.number().int().min(1).max(50).optional().describe('Maximum concurrent requests per host (defaults to concurrency)'),
+    minDelayMs: z.number().int().min(0).max(60_000).optional().describe('Minimum delay between requests to the same host (ms)'),
+    includePatterns: z.array(z.string().max(2000)).max(100).optional().describe('Only crawl URLs matching any of these patterns'),
+    excludePatterns: z.array(z.string().max(2000)).max(100).optional().describe('Do not crawl URLs matching any of these patterns'),
     robots: z.union([
         z.boolean(),
         z.object({
             enabled: z.boolean().optional(),
-            userAgent: z.string().optional(),
+            userAgent: z.string().max(200).optional(),
             respectCrawlDelay: z.boolean().optional(),
         }),
     ]).optional().describe('Opt-in robots.txt compliance'),
@@ -57,17 +63,17 @@ export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({
         z.boolean(),
         z.object({
             enabled: z.boolean().optional(),
-            maxUrls: z.number().int().min(1).optional(),
+            maxUrls: z.number().int().min(1).max(100_000).optional(),
         }),
     ]).optional().describe('Opt-in sitemap seeding'),
     crawlState: z.union([
         z.boolean(),
         z.object({
             enabled: z.boolean().optional(),
-            dir: z.string().optional(),
-            id: z.string().optional(),
+            dir: safeDir.optional(),
+            id: z.string().max(128).regex(/^[a-zA-Z0-9_-]*$/, 'ID must be alphanumeric, hyphens, or underscores').optional(),
             resume: z.boolean().optional(),
-            flushEvery: z.number().int().min(1).optional(),
+            flushEvery: z.number().int().min(1).max(1000).optional(),
             persistPages: z.boolean().optional(),
         }),
     ]).optional().describe('Opt-in resumable crawl state persistence'),

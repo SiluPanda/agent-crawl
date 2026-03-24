@@ -19,7 +19,13 @@ function matchUserAgent(header: string, ua: string): boolean {
     return u.includes(h);
 }
 
+const MAX_ROBOTS_RULES = 10_000; // Cap per section to prevent memory exhaustion
+const MAX_ROBOTS_SECTIONS = 100;
+
 export function parseRobotsTxt(origin: string, content: string, userAgent: string): RobotsTxt {
+    // Strip UTF-8 BOM if present (common in Windows-created files)
+    if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
+
     const lines = content
         .split(/\r?\n/)
         .map((l) => l.replace(/#.*/, '').trim())
@@ -37,19 +43,20 @@ export function parseRobotsTxt(origin: string, content: string, userAgent: strin
 
         if (key === 'user-agent') {
             if (!current || (current && current.disallow.length + current.allow.length > 0)) {
+                if (sections.length >= MAX_ROBOTS_SECTIONS) break;
                 current = { agents: [], disallow: [], allow: [] };
                 sections.push(current);
             }
-            current.agents.push(value);
+            if (current.agents.length < 100) current.agents.push(value);
             continue;
         }
 
         if (!current) continue;
 
         if (key === 'disallow') {
-            current.disallow.push(value);
+            if (current.disallow.length < MAX_ROBOTS_RULES) current.disallow.push(value);
         } else if (key === 'allow') {
-            current.allow.push(value);
+            if (current.allow.length < MAX_ROBOTS_RULES) current.allow.push(value);
         } else if (key === 'crawl-delay') {
             const n = Number(value);
             // Cap at 300s to prevent DoS via malicious robots.txt (Infinity, huge values)
@@ -121,21 +128,22 @@ function pathAllowed(urlPath: string, rules: RobotsRuleSet): boolean {
     let bestType: 'allow' | 'disallow' | null = null;
     let bestLen = -1;
 
-    for (const a of rules.allow) {
-        if (!a) continue;
-        if (!robotsPatternMatch(a, urlPath)) continue;
-        if (a.length > bestLen) {
-            bestType = 'allow';
-            bestLen = a.length;
-        }
-    }
-
     for (const d of rules.disallow) {
         if (!d) continue;
         if (!robotsPatternMatch(d, urlPath)) continue;
         if (d.length > bestLen) {
             bestType = 'disallow';
             bestLen = d.length;
+        }
+    }
+
+    // Allow is checked second with >= so that ties favor allow (per spec)
+    for (const a of rules.allow) {
+        if (!a) continue;
+        if (!robotsPatternMatch(a, urlPath)) continue;
+        if (a.length >= bestLen) {
+            bestType = 'allow';
+            bestLen = a.length;
         }
     }
 
@@ -156,6 +164,9 @@ const ROBOTS_MAX_BYTES = 1_000_000; // 1MB limit for robots.txt
 async function readTextWithLimit(response: Response, maxBytes: number): Promise<string | null> {
     const body = response.body;
     if (!body) {
+        // Pre-flight Content-Length check before reading entire body
+        const cl = Number(response.headers.get('content-length') || '0');
+        if (Number.isFinite(cl) && cl > maxBytes) return null;
         const text = await response.text();
         if (new TextEncoder().encode(text).byteLength > maxBytes) return null;
         return text;
@@ -170,7 +181,6 @@ async function readTextWithLimit(response: Response, maxBytes: number): Promise<
             if (value) {
                 total += value.byteLength;
                 if (total > maxBytes) {
-                    await reader.cancel().catch(() => {});
                     return null;
                 }
                 chunks.push(value);
@@ -178,6 +188,8 @@ async function readTextWithLimit(response: Response, maxBytes: number): Promise<
         }
     } catch {
         return null;
+    } finally {
+        await reader.cancel().catch(() => {});
     }
     const merged = new Uint8Array(total);
     let offset = 0;
@@ -192,6 +204,18 @@ const ROBOTS_MAX_REDIRECTS = 5;
 
 export async function fetchRobotsTxt(origin: string, userAgent: string): Promise<RobotsTxt | null> {
     let currentUrl = `${origin.replace(/\/$/, '')}/robots.txt`;
+    // SSRF defense-in-depth: validate the constructed robots.txt URL
+    try {
+        const parsed = new URL(currentUrl);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        if (isPrivateHost(parsed.hostname)) return null;
+        // Strip userinfo
+        parsed.username = '';
+        parsed.password = '';
+        currentUrl = parsed.href;
+    } catch {
+        return null;
+    }
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10_000);
     try {
@@ -203,28 +227,34 @@ export async function fetchRobotsTxt(origin: string, userAgent: string): Promise
                 signal: controller.signal,
                 redirect: 'manual',
             });
-            const isRedirect = res.status >= 301 && res.status <= 308 && res.status !== 304;
+            const isRedirect = res.status === 301 || res.status === 302 || res.status === 303 || res.status === 307 || res.status === 308;
             if (!isRedirect) break;
 
             const location = res.headers.get('location');
-            res.body?.cancel().catch(() => {});
+            await res.body?.cancel().catch(() => {});
             if (!location) return null;
 
             let nextUrl: URL;
             try { nextUrl = new URL(location, currentUrl); } catch { return null; }
+            // Strip userinfo to prevent credential injection
+            nextUrl.username = '';
+            nextUrl.password = '';
             if (isPrivateHost(nextUrl.hostname)) return null;
             if (nextUrl.protocol !== 'http:' && nextUrl.protocol !== 'https:') return null;
             currentUrl = nextUrl.href;
+            // Reject excessively long redirect URLs
+            if (currentUrl.length > 8192) return null;
 
             if (i === ROBOTS_MAX_REDIRECTS) return null;
         }
         if (!res || !res.ok) {
-            res?.body?.cancel().catch(() => {});
+            await res?.body?.cancel().catch(() => {});
             return null;
         }
-        const contentLength = Number(res.headers.get('content-length') || '0');
-        if (contentLength > ROBOTS_MAX_BYTES) {
-            res.body?.cancel().catch(() => {});
+        const rawCL = res.headers.get('content-length');
+        const contentLength = rawCL ? Number(rawCL) : 0;
+        if (Number.isFinite(contentLength) && contentLength > 0 && contentLength > ROBOTS_MAX_BYTES) {
+            await res.body?.cancel().catch(() => {});
             return null;
         }
         const text = await readTextWithLimit(res, ROBOTS_MAX_BYTES);

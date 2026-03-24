@@ -219,7 +219,7 @@ test('hybrid mode falls back to browser for dynamic pages', async () => {
             assert.deepEqual(receivedStealthOptions, { stealth: true, stealthLevel: 'basic' });
             assert.equal(page.content, 'Rendered');
             assert.equal(page.metadata?.status, 200);
-            assert.equal(page.metadata?.['x-source'], 'browser');
+            assert.equal(page.metadata?.responseHeaders?.['x-source'], 'browser');
             assert.equal(page.metadata?.stealthApplied, true);
             assert.equal(page.metadata?.stealthLevel, 'basic');
         }
@@ -255,7 +255,7 @@ test('browser mode surfaces non-2xx browser response as error', async () => {
             const page = await AgentCrawl.scrape('https://example.com/down', { mode: 'browser', stealth: true });
             assert.equal(page.content, '');
             assert.equal(page.metadata?.status, 503);
-            assert.equal(page.metadata?.['retry-after'], '120');
+            assert.equal(page.metadata?.responseHeaders?.['retry-after'], '120');
             assert.match(String(page.metadata?.error), /HTTP 503/);
             assert.deepEqual(receivedStealthOptions, { stealth: true, stealthLevel: 'balanced' });
         }

@@ -122,7 +122,7 @@ test('times out and returns timeout error when fetch aborts', async () => {
     assert.equal(result.error, 'Request timed out');
 });
 
-test('flags json content-type as browser-needed', async () => {
+test('rejects json content-type as non-HTML', async () => {
     globalThis.fetch = (async () => {
         return new Response('{"ok":true}', {
             status: 200,
@@ -134,6 +134,6 @@ test('flags json content-type as browser-needed', async () => {
     const result = await fetcher.fetch('https://example.com/api', { retries: 0 });
 
     assert.equal(result.isStaticSuccess, false);
-    assert.equal(result.needsBrowser, true);
-    assert.match(String(result.error), /client-side rendered/i);
+    assert.equal(result.needsBrowser, false);
+    assert.match(String(result.error), /non-html content type/i);
 });

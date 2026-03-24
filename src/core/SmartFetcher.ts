@@ -1,6 +1,7 @@
 import { FetchOptions, FetchResult, HttpCacheConfig } from '../types.js';
 import { HttpDiskCache } from './HttpDiskCache.js';
 import { isPrivateHost } from './UrlUtils.js';
+import path from 'node:path';
 
 const USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -12,6 +13,14 @@ const USER_AGENTS = [
 ];
 
 const DEFAULT_MAX_RESPONSE_BYTES = 50 * 1024 * 1024; // 50MB safety limit
+const MAX_URL_LENGTH = 8192; // 8KB — matches common server limits
+
+// Headers that callers should never override — could break HTTP semantics or enable request smuggling
+const BLOCKED_REQUEST_HEADERS = new Set([
+    'host', 'transfer-encoding', 'content-length', 'connection',
+    'keep-alive', 'te', 'trailer', 'upgrade', 'proxy-authorization',
+    'proxy-connection', 'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site',
+]);
 
 /**
  * Handles static HTTP fetching with advanced features:
@@ -21,6 +30,8 @@ const DEFAULT_MAX_RESPONSE_BYTES = 50 * 1024 * 1024; // 50MB safety limit
  */
 export class SmartFetcher {
     private userAgentIndex = 0;
+    private httpCacheInstances = new Map<string, HttpDiskCache>();
+    private static readonly MAX_CACHE_INSTANCES = 50;
 
     private getNextUserAgent(): string {
         const ua = USER_AGENTS[this.userAgentIndex];
@@ -28,15 +39,34 @@ export class SmartFetcher {
         return ua;
     }
 
+    private static safeCacheDir(dir: string): string {
+        const segments = dir.split(/[\\/]/);
+        if (segments.some(s => s === '..')) {
+            throw new Error(`Path traversal not allowed in cache dir: ${dir.slice(0, 100)}`);
+        }
+        return dir;
+    }
+
     private httpCacheFromOptions(httpCache: boolean | HttpCacheConfig | undefined): HttpDiskCache | null {
         if (!httpCache) return null;
         const cfg = typeof httpCache === 'boolean' ? {} : httpCache;
         const enabled = cfg.enabled ?? true;
         if (!enabled) return null;
-        const dir = cfg.dir ?? '.cache/agent-crawl/http';
+        const dir = SmartFetcher.safeCacheDir(cfg.dir ?? '.cache/agent-crawl/http');
         const ttlMs = cfg.ttlMs ?? 5 * 60_000;
         const maxEntries = cfg.maxEntries ?? 1000;
-        return new HttpDiskCache({ dir, ttlMs, maxEntries });
+        // Reuse instances with the same config to avoid redundant mkdir and pruning resets
+        const cacheKey = `${dir}:${ttlMs}:${maxEntries}`;
+        let instance = this.httpCacheInstances.get(cacheKey);
+        if (!instance) {
+            if (this.httpCacheInstances.size >= SmartFetcher.MAX_CACHE_INSTANCES) {
+                const oldestKey = this.httpCacheInstances.keys().next().value;
+                if (oldestKey) this.httpCacheInstances.delete(oldestKey);
+            }
+            instance = new HttpDiskCache({ dir, ttlMs, maxEntries });
+            this.httpCacheInstances.set(cacheKey, instance);
+        }
+        return instance;
     }
 
     /**
@@ -44,10 +74,27 @@ export class SmartFetcher {
      * Uses heuristics like content length, presence of SPA div hooks, etc.
      */
     private requiresJavaScript(html: string, headers: Headers): boolean {
-        const lowerHtml = html.toLowerCase();
+        // Only inspect the first 50KB — sufficient for SPA detection heuristics
+        // and avoids expensive regex operations on multi-MB HTML
+        const sample = html.length > 50_000 ? html.slice(0, 50_000) : html;
+        const lowerHtml = sample.toLowerCase();
 
-        // Extract text content once for reuse (strip all HTML tags)
-        const textContent = html.replace(/<[^>]*>/g, '').trim();
+        // Extract text content once for reuse (strip all HTML tags).
+        // Uses indexOf loop instead of regex to avoid O(n²) on pathological input
+        // with many unclosed '<' characters.
+        let textContent = '';
+        {
+            let i = 0;
+            while (i < sample.length) {
+                const open = sample.indexOf('<', i);
+                if (open === -1) { textContent += sample.slice(i); break; }
+                if (open > i) textContent += sample.slice(i, open);
+                const close = sample.indexOf('>', open + 1);
+                if (close === -1) break; // unclosed tag — stop, don't scan rest
+                i = close + 1;
+            }
+            textContent = textContent.trim();
+        }
 
         // Check 1: Very short content often implies a loader or redirect
         if (html.length < 500 && !lowerHtml.includes('<body')) {
@@ -77,7 +124,7 @@ export class SmartFetcher {
         }
 
         // Check 4: Has script tags but minimal HTML content
-        const scriptCount = (html.match(/<script/gi) || []).length;
+        const scriptCount = (sample.match(/<script/gi) || []).length;
         if (scriptCount > 3 && textContent.length < 300) {
             return true;
         }
@@ -95,17 +142,34 @@ export class SmartFetcher {
         return 'Unknown fetch error';
     }
 
+    private static readonly MAX_BACKOFF_MS = 10_000; // Cap individual backoff waits
+
     private async wait(ms: number): Promise<void> {
-        await new Promise((resolve) => setTimeout(resolve, ms));
+        await new Promise((resolve) => setTimeout(resolve, Math.min(ms, SmartFetcher.MAX_BACKOFF_MS)));
     }
 
     private async readBodyWithLimit(response: Response, maxBytes: number): Promise<string> {
         // Node fetch exposes a web ReadableStream.
         const body = response.body;
         if (!body) {
-            // Fallback for environments where body stream is unavailable
+            // Fallback for environments where body stream is unavailable.
+            // Pre-flight Content-Length check to avoid reading oversized bodies.
+            const clHeader = response.headers.get('content-length');
+            if (clHeader) {
+                const cl = Number(clHeader);
+                if (Number.isFinite(cl) && cl > maxBytes) {
+                    throw new Error(`Response too large (>${maxBytes} bytes)`);
+                }
+            }
+            // Prefer arrayBuffer (gives byte-accurate size) but fall back to text
+            if (typeof response.arrayBuffer === 'function') {
+                const buf = await response.arrayBuffer();
+                if (buf.byteLength > maxBytes) {
+                    throw new Error(`Response too large (>${maxBytes} bytes)`);
+                }
+                return new TextDecoder('utf-8', { fatal: false }).decode(buf);
+            }
             const text = await response.text();
-            // Use byte length, not character count, for accurate limit check
             if (new TextEncoder().encode(text).byteLength > maxBytes) {
                 throw new Error(`Response too large (>${maxBytes} bytes)`);
             }
@@ -117,28 +181,30 @@ export class SmartFetcher {
         let buffer = new Uint8Array(Math.min(maxBytes, 256 * 1024)); // Start with 256KB or maxBytes
         let total = 0;
 
-        while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            if (value) {
-                total += value.byteLength;
-                if (total > maxBytes) {
-                    try {
-                        await reader.cancel();
-                    } catch {
-                        // ignore
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (value) {
+                    total += value.byteLength;
+                    if (total > maxBytes) {
+                        throw new Error(`Response too large (>${maxBytes} bytes)`);
                     }
-                    throw new Error(`Response too large (>${maxBytes} bytes)`);
+                    // Grow buffer if needed
+                    if (total > buffer.byteLength) {
+                        // Never allocate more than maxBytes to prevent excessive memory use
+                        const newSize = Math.min(maxBytes, Math.max(buffer.byteLength * 2, total));
+                        const newBuffer = new Uint8Array(newSize);
+                        newBuffer.set(buffer.subarray(0, total - value.byteLength));
+                        buffer = newBuffer;
+                    }
+                    buffer.set(value, total - value.byteLength);
                 }
-                // Grow buffer if needed
-                if (total > buffer.byteLength) {
-                    const newSize = Math.min(maxBytes, buffer.byteLength * 2);
-                    const newBuffer = new Uint8Array(Math.max(newSize, total));
-                    newBuffer.set(buffer.subarray(0, total - value.byteLength));
-                    buffer = newBuffer;
-                }
-                buffer.set(value, total - value.byteLength);
             }
+        } finally {
+            // Always release the reader to free the underlying TCP connection,
+            // even on OOM during buffer growth or other unexpected errors.
+            await reader.cancel().catch(() => {});
         }
 
         return new TextDecoder('utf-8', { fatal: false }).decode(buffer.subarray(0, total));
@@ -160,11 +226,47 @@ export class SmartFetcher {
     }
 
     async fetch(url: string, options: FetchOptions = {}): Promise<FetchResult> {
-        const { retries = 2, timeout = 10000, maxResponseBytes, httpCache } = options;
+        const rawRetries = options.retries ?? 2;
+        const retries = Number.isFinite(rawRetries) ? Math.min(Math.max(0, rawRetries), 10) : 2;
+        const rawTimeout = options.timeout ?? 10000;
+        const timeout = Number.isFinite(rawTimeout) ? Math.min(Math.max(1000, rawTimeout), 120_000) : 10000;
+        const { maxResponseBytes, httpCache } = options;
 
-        // SSRF protection: reject private/internal hosts at the network boundary
+        // Reject excessively long URLs to prevent memory waste in cache keys/parsing
+        if (url.length > MAX_URL_LENGTH) {
+            return {
+                url: url.slice(0, 200),
+                finalUrl: url.slice(0, 200),
+                html: '',
+                status: 0,
+                headers: {},
+                isStaticSuccess: false,
+                needsBrowser: false,
+                error: `URL too long (${url.length} chars, max ${MAX_URL_LENGTH})`,
+            };
+        }
+
+        // SSRF protection: reject private/internal hosts and non-HTTP protocols
+        // Also strip userinfo to prevent credential injection via URL (user:pass@host)
         try {
             const parsed = new URL(url);
+            if (parsed.username || parsed.password) {
+                parsed.username = '';
+                parsed.password = '';
+                url = parsed.href;
+            }
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                return {
+                    url,
+                    finalUrl: url,
+                    html: '',
+                    status: 0,
+                    headers: {},
+                    isStaticSuccess: false,
+                    needsBrowser: false,
+                    error: `Non-HTTP protocol blocked: ${parsed.protocol}`,
+                };
+            }
             if (isPrivateHost(parsed.hostname)) {
                 return {
                     url,
@@ -190,6 +292,16 @@ export class SmartFetcher {
             };
         }
 
+        // Filter dangerous headers from user-supplied options before use
+        const safeUserHeaders: Record<string, string> = {};
+        if (options.headers) {
+            for (const [k, v] of Object.entries(options.headers)) {
+                if (!BLOCKED_REQUEST_HEADERS.has(k.toLowerCase())) {
+                    safeUserHeaders[k] = v;
+                }
+            }
+        }
+
         const cache = this.httpCacheFromOptions(httpCache);
         // Look up cache once before retries — cache data doesn't change between attempts
         const cached = cache ? await cache.get(url) : null;
@@ -198,6 +310,7 @@ export class SmartFetcher {
         if (cached?.entry.lastModified) conditionalHeaders['If-Modified-Since'] = cached.entry.lastModified;
 
         for (let attempt = 0; attempt <= retries; attempt++) {
+            // Create fresh controller per attempt so retries get a clean abort signal
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeout);
 
@@ -220,22 +333,23 @@ export class SmartFetcher {
                             'Accept-Language': 'en-US,en;q=0.9',
                             'Accept-Encoding': 'gzip, deflate, br',
                             ...(isInitialRequest ? conditionalHeaders : {}),
-                            ...(isInitialRequest ? options.headers : {}),
+                            ...(isInitialRequest ? safeUserHeaders : {}),
                         },
                         signal: controller.signal,
                         redirect: 'manual',
                     });
 
-                    // 3xx redirects excluding 304 (Not Modified) and 300 (Multiple Choices without Location)
+                    // Only follow standard redirect codes; skip 300 (Multiple Choices),
+                    // 304 (Not Modified), 305 (Use Proxy), 306 (unused)
                     const status = response.status;
-                    const isRedirect = status >= 301 && status <= 308 && status !== 304;
+                    const isRedirect = status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
                     if (!isRedirect) break;
 
                     const location = response.headers.get('location');
                     if (!location) break;
 
-                    // Drain redirect response body
-                    response.body?.cancel().catch(() => {});
+                    // Drain redirect response body — await to release the socket before the next hop
+                    await response.body?.cancel().catch(() => {});
 
                     // HTTP spec: 301/302/303 change method to GET; 307/308 preserve method
                     if (status === 301 || status === 302 || status === 303) {
@@ -257,6 +371,10 @@ export class SmartFetcher {
                             error: `Invalid redirect location: ${location.slice(0, 200)}`,
                         };
                     }
+
+                    // Strip userinfo from redirect target to prevent credential injection
+                    nextUrl.username = '';
+                    nextUrl.password = '';
 
                     // SSRF: validate redirect target is not a private host
                     if (isPrivateHost(nextUrl.hostname)) {
@@ -288,6 +406,20 @@ export class SmartFetcher {
 
                     currentUrl = nextUrl.href;
 
+                    // Reject excessively long redirect URLs
+                    if (currentUrl.length > MAX_URL_LENGTH) {
+                        return {
+                            url,
+                            finalUrl: currentUrl.slice(0, 200),
+                            html: '',
+                            status: 0,
+                            headers: {},
+                            isStaticSuccess: false,
+                            needsBrowser: false,
+                            error: `Redirect URL too long (${currentUrl.length} chars, max ${MAX_URL_LENGTH})`,
+                        };
+                    }
+
                     if (redirectCount === SmartFetcher.MAX_REDIRECTS) {
                         return {
                             url,
@@ -306,13 +438,17 @@ export class SmartFetcher {
                     throw new Error('No response received');
                 }
 
-                const headers: Record<string, string> = {};
+                const headers: Record<string, string> = Object.create(null);
+                let headerCount = 0;
                 response.headers.forEach((value, key) => {
-                    headers[key] = value;
+                    // Cap header count and value size to prevent memory exhaustion from malicious servers
+                    if (headerCount >= 200) return;
+                    headers[key] = value.length > 8192 ? value.slice(0, 8192) : value;
+                    headerCount++;
                 });
 
                 if (response.status === 304 && cached) {
-                    response.body?.cancel().catch(() => {});
+                    await response.body?.cancel().catch(() => {});
                     return {
                         url,
                         finalUrl: currentUrl,
@@ -328,7 +464,7 @@ export class SmartFetcher {
                 if (!response.ok) {
                     const isRetryable = response.status >= 500 || response.status === 408 || response.status === 429;
                     // Always drain response body to release the socket
-                    response.body?.cancel().catch(() => {});
+                    await response.body?.cancel().catch(() => {});
                     if (isRetryable && attempt < retries) {
                         await this.wait(1000 * (attempt + 1));
                         continue;
@@ -349,7 +485,7 @@ export class SmartFetcher {
                 // Reject non-HTML content types early to avoid processing binary data
                 const contentType = response.headers.get('content-type') || '';
                 if (contentType && !this.isAcceptableContentType(contentType)) {
-                    response.body?.cancel().catch(() => {});
+                    await response.body?.cancel().catch(() => {});
                     return {
                         url,
                         finalUrl: currentUrl,
@@ -363,12 +499,13 @@ export class SmartFetcher {
                 }
 
                 let html: string;
-                const effectiveMaxBytes = (maxResponseBytes && maxResponseBytes > 0)
-                    ? maxResponseBytes
+                const effectiveMaxBytes = (Number.isFinite(maxResponseBytes) && maxResponseBytes! > 0)
+                    ? Math.min(maxResponseBytes!, DEFAULT_MAX_RESPONSE_BYTES)
                     : DEFAULT_MAX_RESPONSE_BYTES;
-                const contentLength = Number(response.headers.get('content-length') || '0');
-                if (contentLength && contentLength > effectiveMaxBytes) {
-                    response.body?.cancel().catch(() => {});
+                const rawCL = response.headers.get('content-length');
+                const contentLength = rawCL ? Number(rawCL) : 0;
+                if (Number.isFinite(contentLength) && contentLength > 0 && contentLength > effectiveMaxBytes) {
+                    await response.body?.cancel().catch(() => {});
                     return {
                         url,
                         finalUrl: currentUrl,

@@ -27,7 +27,7 @@ test('crawlState persists and resumes frontier', async () => {
     };
 
     try {
-        const startUrl = 'https://state.example/';
+        const startUrl = 'https://state-crawl.site/';
         const id = 'resume-test';
 
         const first = await AgentCrawl.crawl(startUrl, {

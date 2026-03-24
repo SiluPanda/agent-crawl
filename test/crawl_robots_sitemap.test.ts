@@ -14,7 +14,7 @@ test.afterEach(() => {
 });
 
 test('crawl respects robots.txt when enabled and seeds from sitemap.xml (mocked HTTP)', async () => {
-    const origin = 'https://mock.example';
+    const origin = 'https://mock-crawl.site';
 
     // Mock HTTP endpoints used by crawl:
     // - fetchRobotsTxt() uses global fetch to GET /robots.txt

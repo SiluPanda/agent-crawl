@@ -11,8 +11,9 @@ export class CacheManager {
 
     constructor(ttl = 60000 * 5, maxSize = 100) { // Default 5 mins, 100 items
         this.cache = new Map();
-        this.ttl = ttl;
-        this.maxSize = maxSize;
+        // Guard NaN: NaN comparisons always return false, making TTL checks pass for expired items
+        this.ttl = Number.isFinite(ttl) ? Math.max(0, ttl) : 60000 * 5;
+        this.maxSize = Number.isFinite(maxSize) ? Math.max(1, maxSize) : 100;
     }
 
     /**
@@ -32,7 +33,15 @@ export class CacheManager {
         this.cache.delete(key);
         this.cache.set(key, item);
 
-        return item.data;
+        // Deep-copy to prevent caller mutations from corrupting the cache.
+        // structuredClone handles nested objects (metadata, links, chunks).
+        try {
+            return structuredClone(item.data);
+        } catch {
+            // Non-cloneable value (shouldn't happen with JSON-like ScrapedPage, but defensive)
+            this.cache.delete(key);
+            return null;
+        }
     }
 
     set(key: string, data: ScrapedPage): void {
@@ -45,7 +54,12 @@ export class CacheManager {
                 this.cache.delete(oldestKey);
             }
         }
-        this.cache.set(key, { data, timestamp: Date.now() });
+        // Store a deep copy to isolate from caller mutations
+        try {
+            this.cache.set(key, { data: structuredClone(data), timestamp: Date.now() });
+        } catch {
+            // Non-cloneable value — skip caching rather than crashing
+        }
     }
 
     clear(): void {

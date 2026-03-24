@@ -55,21 +55,29 @@ test('crawl schema applies numeric defaults', () => {
 });
 
 test('crawl schema rejects invalid numeric bounds', () => {
-    assert.throws(
-        () =>
-            CrawlOptionsSchema.parse({
-                url: 'https://example.com',
-                maxDepth: 0,
-            }),
-        /Too small|>=1/i
+    // maxDepth: 0 is valid (crawl only the start URL)
+    assert.doesNotThrow(() =>
+        CrawlOptionsSchema.parse({ url: 'https://example.com', maxDepth: 0 })
     );
 
+    // maxDepth: -1 is invalid
     assert.throws(
-        () =>
-            CrawlOptionsSchema.parse({
-                url: 'https://example.com',
-                concurrency: 0,
-            }),
-        /Too small|>=1/i
+        () => CrawlOptionsSchema.parse({ url: 'https://example.com', maxDepth: -1 }),
+    );
+
+    // concurrency: 0 is invalid (min is 1)
+    assert.throws(
+        () => CrawlOptionsSchema.parse({ url: 'https://example.com', concurrency: 0 }),
+    );
+
+    // Values above upper bounds are rejected
+    assert.throws(
+        () => CrawlOptionsSchema.parse({ url: 'https://example.com', maxDepth: 101 }),
+    );
+    assert.throws(
+        () => CrawlOptionsSchema.parse({ url: 'https://example.com', concurrency: 51 }),
+    );
+    assert.throws(
+        () => CrawlOptionsSchema.parse({ url: 'https://example.com', maxPages: 100_001 }),
     );
 });

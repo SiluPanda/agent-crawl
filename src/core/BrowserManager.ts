@@ -65,9 +65,28 @@ export class BrowserManager {
                     console.log('[BrowserManager] Launching new browser instance...');
                     const browser = await chromium.launch({
                         headless: true,
-                        args: ['--no-sandbox', '--disable-setuid-sandbox']
+                        args: [
+                            '--no-sandbox',
+                            '--disable-setuid-sandbox',
+                            '--disable-gpu',
+                            '--disable-dev-shm-usage',
+                            '--disable-extensions',
+                            '--disable-background-networking',
+                            '--disable-default-apps',
+                            '--disable-sync',
+                            '--no-first-run',
+                        ]
                     });
                     this.browser = browser;
+
+                    // Listen for unexpected disconnection to clean up state
+                    browser.on('disconnected', () => {
+                        if (this.browser === browser) {
+                            this.browser = null;
+                            this.launchPromise = null;
+                        }
+                    });
+
                     return browser;
                 } catch (e) {
                     this.launchPromise = null;
@@ -87,24 +106,97 @@ export class BrowserManager {
      * - Wait for specifc selectors
      * - Auto-closes context
      */
+    private static readonly OVERALL_TIMEOUT_MS = 45_000; // 45s hard cap for entire getPage
+    private static readonly MAX_PAGE_CONTENT_BYTES = 20 * 1024 * 1024; // 20MB cap for page content
+    private static readonly MAX_CONCURRENT_PAGES = 10; // Limit concurrent browser contexts to prevent OOM
+
     async getPage(url: string, waitForSelector?: string, options: BrowserPageOptions = {}): Promise<BrowserPageResult> {
-        // SSRF protection: reject private/internal hosts
+        if (url.length > 8192) {
+            throw new Error(`URL too long (${url.length} chars)`);
+        }
+
+        // SSRF protection: reject non-HTTP protocols and private/internal hosts
+        // Strip userinfo to prevent credential injection via URL (user:pass@host)
         try {
             const parsed = new URL(url);
+            if (parsed.username || parsed.password) {
+                parsed.username = '';
+                parsed.password = '';
+                url = parsed.href;
+            }
+            if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+                throw new Error(`Non-HTTP protocol blocked: ${parsed.protocol}`);
+            }
             if (isPrivateHost(parsed.hostname)) {
                 throw new Error('Request to private/internal host blocked');
             }
         } catch (e: any) {
-            if (e.message.includes('private/internal')) throw e;
+            const msg = typeof e?.message === 'string' ? e.message : '';
+            if (msg.includes('private/internal') || msg.includes('protocol blocked')) throw e;
             throw new Error(`Invalid URL: ${sanitizeUrlForLog(url)}`);
         }
 
+        // Reserve a page slot atomically — increment now, decrement in finally.
+        // This prevents N callers from passing the gate before any increment.
+        await this.acquirePageSlot();
+
+        // Overall timeout to prevent cumulative hangs across launch + navigate + wait + extract
+        let timeoutTimer: NodeJS.Timeout | undefined;
+        try {
+            const result = await Promise.race([
+                this.getPageInner(url, waitForSelector, options),
+                new Promise<never>((_, reject) => {
+                    timeoutTimer = setTimeout(() => reject(new Error(`Browser page load timed out after ${BrowserManager.OVERALL_TIMEOUT_MS}ms`)), BrowserManager.OVERALL_TIMEOUT_MS);
+                    timeoutTimer.unref();
+                }),
+            ]);
+            return result;
+        } finally {
+            if (timeoutTimer) clearTimeout(timeoutTimer);
+            // Slot release happens in getPageInner's finally — NOT here.
+            // On timeout, getPageInner continues running; releasing the slot
+            // here would let new contexts exceed MAX_CONCURRENT_PAGES.
+        }
+    }
+
+    private async acquirePageSlot(): Promise<void> {
+        const deadline = Date.now() + BrowserManager.OVERALL_TIMEOUT_MS;
+        while (this.activePages >= BrowserManager.MAX_CONCURRENT_PAGES) {
+            if (Date.now() > deadline) {
+                throw new Error('Timed out waiting for available browser page slot');
+            }
+            await new Promise(r => setTimeout(r, 100));
+        }
+        // Increment immediately after the check — no awaits between check and increment
+        this.activePages++;
+    }
+
+    private async getPageInner(url: string, waitForSelector?: string, options: BrowserPageOptions = {}): Promise<BrowserPageResult> {
+        // Top-level try/finally guarantees the page slot is released even if
+        // launch() or newContext() throw before we enter the context try/finally.
+        try {
+            return await this.getPageImpl(url, waitForSelector, options);
+        } finally {
+            this.activePages = Math.max(0, this.activePages - 1);
+            this.resetIdleTimer();
+        }
+    }
+
+    private async getPageImpl(url: string, waitForSelector?: string, options: BrowserPageOptions = {}): Promise<BrowserPageResult> {
         const stealth = options.stealth ?? false;
         const stealthLevel = options.stealthLevel ?? 'balanced';
-        const browser = await this.launch();
-        const context = await browser.newContext(this.getContextOptions(stealth));
+        let browser = await this.launch();
+        let context: BrowserContext;
+        try {
+            context = await browser.newContext(this.getContextOptions(stealth));
+        } catch {
+            // Browser may have disconnected between launch() and newContext() — retry once
+            this.browser = null;
+            this.launchPromise = null;
+            browser = await this.launch();
+            context = await browser.newContext(this.getContextOptions(stealth));
+        }
 
-        this.activePages++;
         this.clearIdleTimer(); // We are active
 
         try {
@@ -117,9 +209,11 @@ export class BrowserManager {
             page.setDefaultTimeout(15000); // 15 seconds max for any operation
             // Optimization: Block unnecessary resources
             // This drastically reduces load time and bandwidth usage
+            // Block websocket/eventsource to prevent long-lived connections and data exfiltration.
+            // Block ping to prevent beacon tracking via <a ping="...">.
             const blockedResourceTypes = stealth
-                ? ['image', 'font', 'media']
-                : ['image', 'stylesheet', 'font', 'media'];
+                ? ['image', 'font', 'media', 'websocket', 'eventsource', 'manifest', 'ping']
+                : ['image', 'stylesheet', 'font', 'media', 'websocket', 'eventsource', 'manifest', 'ping'];
             await page.route('**/*', (route: Route) => {
                 const request = route.request();
 
@@ -154,7 +248,8 @@ export class BrowserManager {
                     throw new Error('Redirect to private/internal host blocked');
                 }
             } catch (e: any) {
-                if (e.message.includes('private/internal')) throw e;
+                const emsg = typeof e?.message === 'string' ? e.message : '';
+                if (emsg.includes('private/internal')) throw e;
                 throw new Error(`Navigation resulted in invalid URL: ${sanitizeUrlForLog(finalUrl)}`);
             }
 
@@ -162,11 +257,16 @@ export class BrowserManager {
             await this.dismissCookieBanners(page);
 
             if (waitForSelector) {
-                await page.waitForSelector(waitForSelector, { timeout: 10000 });
+                // Limit selector length to prevent abuse
+                const safeSelector = waitForSelector.slice(0, 500);
+                await page.waitForSelector(safeSelector, { timeout: 10000 });
             }
 
-            // Extract content
+            // Extract content with size limit to prevent OOM from enormous DOMs
             const content = await page.content();
+            if (Buffer.byteLength(content, 'utf-8') > BrowserManager.MAX_PAGE_CONTENT_BYTES) {
+                throw new Error(`Page content too large (>${BrowserManager.MAX_PAGE_CONTENT_BYTES} bytes)`);
+            }
             return {
                 html: content,
                 status: response?.status() ?? 200,
@@ -174,12 +274,10 @@ export class BrowserManager {
                 finalUrl,
             };
         } catch (e: any) {
-            console.error(`[BrowserManager] Failed to load ${sanitizeUrlForLog(url)}: ${e.message}`);
+            console.error(`[BrowserManager] Failed to load ${sanitizeUrlForLog(url)}: ${e instanceof Error ? e.message : String(e)}`);
             throw e;
         } finally {
             await context.close().catch(() => {});
-            this.activePages = Math.max(0, this.activePages - 1);
-            this.resetIdleTimer();
         }
     }
 
@@ -328,9 +426,9 @@ export class BrowserManager {
         }
     }
 
-    async close() {
-        // Skip close if pages are still active (idle timer will retry)
-        if (this.activePages > 0) return;
+    async close(force = false) {
+        // Skip close if pages are still active (idle timer will retry), unless forced
+        if (this.activePages > 0 && !force) return;
 
         // Clear idle timer to prevent stale timer from closing a future browser instance
         this.clearIdleTimer();
@@ -343,9 +441,10 @@ export class BrowserManager {
             try {
                 this.launchPromise = null;
                 if (this.browser) {
-                    console.log('[BrowserManager] Closing browser instance (idle).');
-                    await this.browser.close();
+                    console.log('[BrowserManager] Closing browser instance.');
+                    const b = this.browser;
                     this.browser = null;
+                    await b.close().catch(() => {});
                 }
             } finally {
                 this.closing = null;
@@ -386,6 +485,8 @@ export class BrowserManager {
             'button:has-text("OK")',
         ];
 
+        const urlBefore = page.url();
+
         for (const selector of acceptSelectors) {
             try {
                 const button = await page.$(selector);
@@ -393,6 +494,8 @@ export class BrowserManager {
                     await button.click();
                     // Wait briefly for banner to disappear
                     await page.waitForTimeout(300);
+                    // Guard: abort if the click triggered navigation (form submit, etc.)
+                    if (page.url() !== urlBefore) return;
                     return;
                 }
             } catch {
