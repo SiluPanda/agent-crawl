@@ -12,7 +12,7 @@ export default defineConfig([
         external: ['cheerio', 'playwright-core', 'zod', 'undici'],
     },
     {
-        entry: ['src/cli.ts'],
+        entry: ['src/cli.ts', 'src/mcp.ts'],
         format: ['esm'],
         dts: false,
         clean: false,
