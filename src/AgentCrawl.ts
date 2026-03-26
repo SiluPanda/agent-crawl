@@ -2,7 +2,8 @@ import { SmartFetcher } from './core/SmartFetcher.js';
 import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
-import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig } from './types.js';
+import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig } from './types.js';
+import { extractCss, extractRegex } from './core/Extractor.js';
 import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog, isPrivateHost } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
 import { HostScheduler } from './core/HostScheduler.js';
@@ -23,6 +24,7 @@ interface NormalizedScrapeConfig {
     cache?: boolean | DiskCacheConfig;
     httpCache?: boolean | HttpCacheConfig;
     chunking?: boolean | ChunkingConfig;
+    extraction?: ExtractionConfig;
 }
 
 /**
@@ -79,6 +81,7 @@ export class AgentCrawl {
             cache: config.cache,
             httpCache: config.httpCache,
             chunking: config.chunking,
+            extraction: config.extraction,
         };
     }
 
@@ -169,7 +172,7 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction } = normalizedConfig;
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
         const normalizedUrl = this.normalizeUrlForDedupe(url);
@@ -263,11 +266,26 @@ export class AgentCrawl {
             optimizeTokens,
         });
 
+        // Run structured data extraction if configured
+        let extractedData: Record<string, unknown> | undefined;
+        if (extraction) {
+            try {
+                if (extraction.type === 'css') {
+                    extractedData = extractCss(html, finalUrl, extraction);
+                } else if (extraction.type === 'regex') {
+                    extractedData = extractRegex(extracted.markdown, extraction);
+                }
+            } catch {
+                // Extraction errors are non-fatal — the page still returns with content
+            }
+        }
+
         const result: ScrapedPage = {
             url: finalUrl,
             content: extracted.markdown,
             title: extracted.title,
             links: extracted.links,
+            extracted: extractedData,
             metadata: (() => {
                 // Place response headers under a dedicated key to prevent
                 // server-controlled header names from overwriting reserved fields
@@ -356,6 +374,7 @@ export class AgentCrawl {
             cache: config.cache,
             httpCache: config.httpCache,
             chunking: config.chunking,
+            extraction: config.extraction,
         };
 
         // Reject excessively long start URLs before any processing

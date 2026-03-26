@@ -1,5 +1,20 @@
 import { z } from 'zod';
 
+/** Schema for a single CSS extraction field definition (supports nesting). */
+const CssFieldSchema: z.ZodType = z.object({
+    selector: z.string().max(500),
+    type: z.enum(['text', 'attribute', 'html']).optional(),
+    attribute: z.string().max(200).optional(),
+    all: z.boolean().optional(),
+    fields: z.record(
+        z.string().max(200),
+        z.union([
+            z.string().max(500),
+            z.lazy((): z.ZodType => CssFieldSchema),
+        ]),
+    ).optional(),
+});
+
 /** Reusable dir validator: rejects path traversal via ".." segments */
 const safeDir = z.string().max(500).refine(
     (dir) => !dir.split(/[\\/]/).some(s => s === '..'),
@@ -41,6 +56,25 @@ export const ScrapeOptionsSchema = z.object({
             overlapTokens: z.number().int().min(0).max(50_000).optional(),
         }),
     ]).optional().describe('Opt-in token-aware chunking with citation anchors'),
+    extraction: z.union([
+        z.object({
+            type: z.literal('css'),
+            schema: z.record(
+                z.string().max(200),
+                z.union([
+                    z.string().max(500),
+                    z.lazy((): z.ZodType => CssFieldSchema),
+                ]),
+            ).refine(obj => Object.keys(obj).length <= 100, 'Maximum 100 top-level fields'),
+        }),
+        z.object({
+            type: z.literal('regex'),
+            patterns: z.record(
+                z.string().max(200),
+                z.string().max(2000),
+            ).refine(obj => Object.keys(obj).length <= 100, 'Maximum 100 patterns'),
+        }),
+    ]).optional().describe('Opt-in structured data extraction (CSS or regex)'),
 });
 
 export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({

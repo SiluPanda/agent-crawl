@@ -37,6 +37,29 @@ export interface ChunkingConfig {
     overlapTokens?: number; // default: 0
 }
 
+/** Defines how to extract a single field via CSS selector. */
+export interface CssFieldDef {
+    selector: string;
+    type?: 'text' | 'attribute' | 'html'; // default: 'text'
+    attribute?: string; // required when type is 'attribute'
+    all?: boolean; // true → return array of all matches; false (default) → first match
+    fields?: Record<string, string | CssFieldDef>; // nested extraction (implies all: true, returns object[])
+}
+
+/** Extract structured data from HTML using CSS selectors. */
+export interface CssExtractionConfig {
+    type: 'css';
+    schema: Record<string, string | CssFieldDef>;
+}
+
+/** Extract data from page text using regex patterns. All global matches are returned. */
+export interface RegexExtractionConfig {
+    type: 'regex';
+    patterns: Record<string, string>; // key → regex pattern string (matched globally)
+}
+
+export type ExtractionConfig = CssExtractionConfig | RegexExtractionConfig;
+
 export interface ScrapeConfig {
     mode?: 'static' | 'hybrid' | 'browser';
     waitFor?: string; // CSS selector to wait for (browser mode only)
@@ -48,6 +71,7 @@ export interface ScrapeConfig {
     cache?: boolean | DiskCacheConfig; // opt-in disk cache for scrape results
     httpCache?: boolean | HttpCacheConfig; // opt-in disk HTTP cache for static fetch
     chunking?: boolean | ChunkingConfig; // opt-in chunking for agent use
+    extraction?: ExtractionConfig; // opt-in structured data extraction
 }
 
 export interface Citation {
@@ -70,6 +94,7 @@ export interface ScrapedPage {
     metadata?: Record<string, any>;
     links?: string[]; // Extracted links from this page
     chunks?: ContentChunk[]; // Optional token-aware chunks (opt-in)
+    extracted?: Record<string, unknown>; // Structured data from extraction config
 }
 
 export interface RobotsConfig {
