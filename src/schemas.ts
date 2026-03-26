@@ -91,6 +91,10 @@ export const ScrapeOptionsSchema = z.object({
             ).refine(obj => Object.keys(obj).length <= 100, 'Maximum 100 patterns'),
         }),
     ]).optional().describe('Opt-in structured data extraction (CSS or regex)'),
+    jsCode: z.union([
+        z.string().max(51200),
+        z.array(z.string().max(51200)).max(10),
+    ]).optional().describe('JavaScript to execute after page load (forces browser mode, max 50KB per script, max 10 scripts)'),
 });
 
 export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({

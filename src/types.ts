@@ -92,6 +92,7 @@ export interface ScrapeConfig {
     proxy?: ProxyConfig; // route requests through a proxy server
     headers?: Record<string, string>; // custom request headers (e.g., Authorization)
     cookies?: CookieDef[]; // cookies to inject into requests
+    jsCode?: string | string[]; // JS to execute after page load (forces browser mode)
 }
 
 export interface Citation {

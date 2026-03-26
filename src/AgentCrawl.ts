@@ -28,6 +28,7 @@ interface NormalizedScrapeConfig {
     proxy?: ProxyConfig;
     headers?: Record<string, string>;
     cookies?: CookieDef[];
+    jsCode?: string[];
 }
 
 /**
@@ -70,6 +71,7 @@ export class AgentCrawl {
             config.proxy?.url || '',
             config.headers ? JSON.stringify(config.headers) : '',
             config.cookies?.length ? config.cookies.map(c => `${c.name}=${c.value}`).join(';') : '',
+            config.jsCode?.length ? config.jsCode.join('\0\0') : '',
         ];
         return parts.join('\0');
     }
@@ -92,6 +94,9 @@ export class AgentCrawl {
             proxy: config.proxy,
             headers: config.headers,
             cookies: config.cookies,
+            jsCode: config.jsCode
+                ? (Array.isArray(config.jsCode) ? config.jsCode : [config.jsCode]).filter(s => s.trim())
+                : undefined,
         };
     }
 
@@ -182,7 +187,7 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode } = normalizedConfig;
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
         const normalizedUrl = this.normalizeUrlForDedupe(url);
@@ -211,9 +216,14 @@ export class AgentCrawl {
         let staticError: string | null = null;
         let shouldUseBrowserFallback = mode === 'browser';
 
-        // 1. Try Static Fetch (if mode is static or hybrid)
+        // jsCode requires browser — force browser mode
+        if (jsCode?.length) {
+            shouldUseBrowserFallback = true;
+        }
+
+        // 1. Try Static Fetch (if mode is static or hybrid, and no jsCode)
         // This is much faster and cheaper than spinning up a browser
-        if (mode === 'static' || mode === 'hybrid') {
+        if ((mode === 'static' || mode === 'hybrid') && !jsCode?.length) {
             const result = await this.fetcher.fetch(url, {
                 maxResponseBytes,
                 httpCache,
@@ -247,6 +257,7 @@ export class AgentCrawl {
                     proxy,
                     headers: customHeaders,
                     cookies,
+                    jsCode,
                 };
                 const browserResult = await this.browserManager.getPage(url, waitFor, browserOptions);
                 browserUsed = true;
@@ -394,6 +405,7 @@ export class AgentCrawl {
             proxy: config.proxy,
             headers: config.headers,
             cookies: config.cookies,
+            jsCode: config.jsCode,
         };
 
         // Reject excessively long start URLs before any processing

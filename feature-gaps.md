@@ -204,7 +204,7 @@ agent-crawl is a focused, security-hardened TypeScript library optimized for AI 
 1. ~~**Structured data extraction** (CSS/XPath/regex strategies) -- highest value, LLM-free~~ **DONE in v3.1.0**
 2. ~~**Proxy support** -- essential for production crawling at scale~~ **DONE in v3.2.0**
 3. ~~**Custom headers / cookie injection** -- required for authenticated crawling~~ **DONE in v3.2.0**
-4. **JavaScript execution** -- post-load JS for interactive pages
+4. ~~**JavaScript execution** -- post-load JS for interactive pages~~ **DONE in v3.3.0**
 5. **Screenshot/PDF capture** -- useful for visual verification and archival
 6. **DFS + priority crawling strategies** -- better crawl efficiency
 7. **Hooks/plugin system** -- extensibility for custom use cases

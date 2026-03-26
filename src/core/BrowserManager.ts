@@ -15,6 +15,7 @@ export interface BrowserPageOptions {
     proxy?: ProxyConfig;
     headers?: Record<string, string>;
     cookies?: CookieDef[];
+    jsCode?: string[];
 }
 
 /**
@@ -279,6 +280,20 @@ export class BrowserManager {
                 // Limit selector length to prevent abuse
                 const safeSelector = waitForSelector.slice(0, 500);
                 await page.waitForSelector(safeSelector, { timeout: 10000 });
+            }
+
+            // Execute user-provided JavaScript after page load + waitFor
+            if (options.jsCode?.length) {
+                for (const script of options.jsCode) {
+                    await page.evaluate(script).catch((err: Error) => {
+                        // Log but don't fail — JS errors are non-fatal
+                        console.warn(`[BrowserManager] jsCode error: ${err.message?.slice(0, 200) ?? 'Unknown'}`);
+                    });
+                    // Brief settle time between scripts for DOM mutations to propagate
+                    await page.waitForTimeout(100);
+                }
+                // Wait for network to settle after JS execution (dynamic content may load)
+                await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
             }
 
             // Extract content with size limit to prevent OOM from enormous DOMs
