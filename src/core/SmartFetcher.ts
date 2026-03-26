@@ -1,4 +1,4 @@
-import { FetchOptions, FetchResult, HttpCacheConfig, ProxyConfig, CookieDef } from '../types.js';
+import { FetchOptions, FetchResult, HttpCacheConfig, ProxyConfig, CookieDef, RetryConfig } from '../types.js';
 import { HttpDiskCache } from './HttpDiskCache.js';
 import { isPrivateHost } from './UrlUtils.js';
 import path from 'node:path';
@@ -147,10 +147,33 @@ export class SmartFetcher {
         return 'Unknown fetch error';
     }
 
-    private static readonly MAX_BACKOFF_MS = 10_000; // Cap individual backoff waits
+    private static readonly DEFAULT_RETRY_ON = [408, 429, 500, 502, 503, 504];
+
+    /** Exponential backoff with jitter: baseDelay * 2^attempt * (1 + random(0, 0.5)) */
+    private static computeBackoff(attempt: number, baseDelayMs: number, maxDelayMs: number): number {
+        const exp = baseDelayMs * Math.pow(2, attempt);
+        const jitter = exp * Math.random() * 0.5; // 0-50% jitter
+        return Math.min(exp + jitter, maxDelayMs);
+    }
+
+    /** Parse Retry-After header: seconds (number) or HTTP-date. Returns ms to wait, or 0. */
+    private static parseRetryAfter(header: string | null, maxMs: number): number {
+        if (!header) return 0;
+        const seconds = Number(header);
+        if (Number.isFinite(seconds) && seconds > 0) {
+            return Math.min(seconds * 1000, maxMs);
+        }
+        // Try HTTP-date format
+        const date = Date.parse(header);
+        if (Number.isFinite(date)) {
+            const ms = date - Date.now();
+            if (ms > 0) return Math.min(ms, maxMs);
+        }
+        return 0;
+    }
 
     private async wait(ms: number): Promise<void> {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(ms, SmartFetcher.MAX_BACKOFF_MS)));
+        await new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     private async readBodyWithLimit(response: Response, maxBytes: number): Promise<string> {
@@ -263,8 +286,13 @@ export class SmartFetcher {
     }
 
     async fetch(url: string, options: FetchOptions = {}): Promise<FetchResult> {
-        const rawRetries = options.retries ?? 2;
+        const retryCfg = options.retry ?? {};
+        const rawRetries = retryCfg.maxRetries ?? options.retries ?? 2;
         const retries = Number.isFinite(rawRetries) ? Math.min(Math.max(0, rawRetries), 10) : 2;
+        const baseDelayMs = Math.max(100, retryCfg.baseDelayMs ?? 1000);
+        const maxDelayMs = Math.max(baseDelayMs, retryCfg.maxDelayMs ?? 30_000);
+        const retryOnCodes = new Set(retryCfg.retryOn ?? SmartFetcher.DEFAULT_RETRY_ON);
+        const respectRetryAfter = retryCfg.respectRetryAfter ?? true;
         const rawTimeout = options.timeout ?? 10000;
         const timeout = Number.isFinite(rawTimeout) ? Math.min(Math.max(1000, rawTimeout), 120_000) : 10000;
         const { maxResponseBytes, httpCache, proxy, cookies } = options;
@@ -528,11 +556,20 @@ export class SmartFetcher {
                 }
 
                 if (!response.ok) {
-                    const isRetryable = response.status >= 500 || response.status === 408 || response.status === 429;
+                    const isRetryable = retryOnCodes.has(response.status);
                     // Always drain response body to release the socket
                     await response.body?.cancel().catch(() => {});
                     if (isRetryable && attempt < retries) {
-                        await this.wait(1000 * (attempt + 1));
+                        // Check Retry-After header for 429/503
+                        let waitMs = SmartFetcher.computeBackoff(attempt, baseDelayMs, maxDelayMs);
+                        if (respectRetryAfter && (response.status === 429 || response.status === 503)) {
+                            const retryAfterMs = SmartFetcher.parseRetryAfter(
+                                response.headers.get('retry-after'),
+                                maxDelayMs,
+                            );
+                            if (retryAfterMs > 0) waitMs = retryAfterMs;
+                        }
+                        await this.wait(waitMs);
                         continue;
                     }
 
@@ -613,7 +650,7 @@ export class SmartFetcher {
                         error: this.getErrorMessage(error),
                     };
                 }
-                await this.wait(1000 * (attempt + 1));
+                await this.wait(SmartFetcher.computeBackoff(attempt, baseDelayMs, maxDelayMs));
             } finally {
                 clearTimeout(timeoutId);
             }

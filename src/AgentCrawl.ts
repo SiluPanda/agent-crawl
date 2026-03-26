@@ -2,7 +2,7 @@ import { SmartFetcher } from './core/SmartFetcher.js';
 import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
-import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks, ScrollConfig, ScrapeTarget, ScrapeManyOptions, ScrapeManyResult, ExtractedTable } from './types.js';
+import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks, ScrollConfig, ScrapeTarget, ScrapeManyOptions, ScrapeManyResult, ExtractedTable, RetryConfig } from './types.js';
 import { extractTables } from './core/TableExtractor.js';
 import { markdownToCitations } from './core/Citations.js';
 import { extractCss, extractRegex } from './core/Extractor.js';
@@ -38,6 +38,7 @@ interface NormalizedScrapeConfig {
     scroll?: ScrollConfig;
     tableExtraction?: boolean;
     citations?: boolean;
+    retry?: RetryConfig;
 }
 
 /**
@@ -114,6 +115,7 @@ export class AgentCrawl {
                 : undefined,
             tableExtraction: config.tableExtraction,
             citations: config.citations,
+            retry: config.retry,
         };
     }
 
@@ -204,7 +206,7 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks, scroll, tableExtraction, citations } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks, scroll, tableExtraction, citations, retry } = normalizedConfig;
         const hasResultModifyingHooks = !!(hooks?.onFetched || hooks?.onResult);
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
@@ -255,6 +257,7 @@ export class AgentCrawl {
                 headers: customHeaders,
                 proxy,
                 cookies,
+                retry,
             });
             status = result.status;
             headers = result.headers;
@@ -488,6 +491,7 @@ export class AgentCrawl {
             scroll: config.scroll,
             tableExtraction: config.tableExtraction,
             citations: config.citations,
+            retry: config.retry,
         };
 
         // Reject excessively long start URLs before any processing

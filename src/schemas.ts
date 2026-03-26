@@ -108,6 +108,13 @@ export const ScrapeOptionsSchema = z.object({
     ]).optional().describe('Auto-scroll for lazy/infinite content loading (forces browser mode)'),
     tableExtraction: z.boolean().optional().describe('Extract HTML tables as structured data (headers + rows)'),
     citations: z.boolean().optional().describe('Convert inline links to numbered footnote references (reduces token usage)'),
+    retry: z.object({
+        maxRetries: z.number().int().min(0).max(10).optional(),
+        baseDelayMs: z.number().int().min(100).max(60_000).optional(),
+        maxDelayMs: z.number().int().min(100).max(120_000).optional(),
+        retryOn: z.array(z.number().int().min(100).max(599)).max(20).optional(),
+        respectRetryAfter: z.boolean().optional(),
+    }).optional().describe('Configure retry behavior with exponential backoff and jitter'),
 });
 
 export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({

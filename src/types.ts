@@ -1,3 +1,12 @@
+/** Configuration for retry behavior with exponential backoff. */
+export interface RetryConfig {
+    maxRetries?: number; // default: 2
+    baseDelayMs?: number; // initial backoff delay (default: 1000)
+    maxDelayMs?: number; // cap on backoff delay (default: 30000)
+    retryOn?: number[]; // HTTP status codes to retry (default: [408, 429, 500, 502, 503, 504])
+    respectRetryAfter?: boolean; // honor Retry-After header on 429/503 (default: true)
+}
+
 export interface FetchOptions {
     method?: 'GET' | 'POST';
     headers?: Record<string, string>;
@@ -7,6 +16,7 @@ export interface FetchOptions {
     httpCache?: boolean | HttpCacheConfig;
     proxy?: ProxyConfig;
     cookies?: CookieDef[];
+    retry?: RetryConfig;
 }
 
 export interface FetchResult {
@@ -131,6 +141,7 @@ export interface ScrapeConfig {
     scroll?: boolean | ScrollConfig; // auto-scroll for lazy/infinite content (forces browser mode)
     tableExtraction?: boolean; // extract HTML tables as structured data
     citations?: boolean; // convert inline links to numbered footnote references
+    retry?: RetryConfig; // configure retry behavior with exponential backoff
 }
 
 export interface Citation {

@@ -31,6 +31,8 @@ Scrape options:
   --scroll-delay <ms>      Delay between scrolls in ms (default: 500)
   --tables                 Extract HTML tables as structured data
   --citations              Convert inline links to numbered footnotes
+  --max-retries <n>        Max retry attempts (default: 2)
+  --retry-delay <ms>       Base retry delay in ms (default: 1000)
 
 Crawl options (in addition to scrape options):
   -d, --depth <n>          Max crawl depth (default: 1)
@@ -111,6 +113,8 @@ async function main() {
                 'scroll-delay': { type: 'string' },
                 tables: { type: 'boolean', default: false },
                 citations: { type: 'boolean', default: false },
+                'max-retries': { type: 'string' },
+                'retry-delay': { type: 'string' },
                 // Crawl-specific
                 depth: { type: 'string', short: 'd' },
                 pages: { type: 'string', short: 'n' },
@@ -175,6 +179,12 @@ async function main() {
 
     if (v.tables) config.tableExtraction = true;
     if (v.citations) config.citations = true;
+    if (v['max-retries'] || v['retry-delay']) {
+        config.retry = {
+            ...(v['max-retries'] ? { maxRetries: parseInt(v['max-retries'] as string, 10) } : {}),
+            ...(v['retry-delay'] ? { baseDelayMs: parseInt(v['retry-delay'] as string, 10) } : {}),
+        };
+    }
 
     if (v['extract-css']) {
         try {
