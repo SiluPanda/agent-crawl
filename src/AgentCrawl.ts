@@ -2,7 +2,8 @@ import { SmartFetcher } from './core/SmartFetcher.js';
 import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
-import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks, ScrollConfig, ScrapeTarget, ScrapeManyOptions, ScrapeManyResult } from './types.js';
+import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks, ScrollConfig, ScrapeTarget, ScrapeManyOptions, ScrapeManyResult, ExtractedTable } from './types.js';
+import { extractTables } from './core/TableExtractor.js';
 import { extractCss, extractRegex } from './core/Extractor.js';
 import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog, isPrivateHost } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
@@ -34,6 +35,7 @@ interface NormalizedScrapeConfig {
     pdf?: boolean;
     hooks?: ScrapeHooks;
     scroll?: ScrollConfig;
+    tableExtraction?: boolean;
 }
 
 /**
@@ -108,6 +110,7 @@ export class AgentCrawl {
             scroll: config.scroll
                 ? (typeof config.scroll === 'boolean' ? { enabled: config.scroll } : config.scroll)
                 : undefined,
+            tableExtraction: config.tableExtraction,
         };
     }
 
@@ -198,7 +201,7 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks, scroll } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks, scroll, tableExtraction } = normalizedConfig;
         const hasResultModifyingHooks = !!(hooks?.onFetched || hooks?.onResult);
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
@@ -341,6 +344,16 @@ export class AgentCrawl {
             }
         }
 
+        // Extract HTML tables if requested
+        let tables: ExtractedTable[] | undefined;
+        if (tableExtraction) {
+            try {
+                tables = extractTables(html);
+            } catch {
+                // Table extraction errors are non-fatal
+            }
+        }
+
         const result: ScrapedPage = {
             url: finalUrl,
             content: extracted.markdown,
@@ -349,6 +362,7 @@ export class AgentCrawl {
             extracted: extractedData,
             screenshot: screenshotB64,
             pdf: pdfB64,
+            tables,
             metadata: (() => {
                 // Place response headers under a dedicated key to prevent
                 // server-controlled header names from overwriting reserved fields
@@ -466,6 +480,7 @@ export class AgentCrawl {
             // Pass scrape-level hooks (onFetched, onResult) but not crawl-specific ones
             hooks: crawlHooks ? { onFetched: crawlHooks.onFetched, onResult: crawlHooks.onResult } : undefined,
             scroll: config.scroll,
+            tableExtraction: config.tableExtraction,
         };
 
         // Reject excessively long start URLs before any processing

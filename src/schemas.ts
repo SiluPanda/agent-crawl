@@ -106,6 +106,7 @@ export const ScrapeOptionsSchema = z.object({
             selector: z.string().max(500).optional(),
         }),
     ]).optional().describe('Auto-scroll for lazy/infinite content loading (forces browser mode)'),
+    tableExtraction: z.boolean().optional().describe('Extract HTML tables as structured data (headers + rows)'),
 });
 
 export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({

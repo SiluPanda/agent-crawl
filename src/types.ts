@@ -129,6 +129,7 @@ export interface ScrapeConfig {
     pdf?: boolean; // capture page as base64 PDF (forces browser mode)
     hooks?: ScrapeHooks; // lifecycle hooks for customization
     scroll?: boolean | ScrollConfig; // auto-scroll for lazy/infinite content (forces browser mode)
+    tableExtraction?: boolean; // extract HTML tables as structured data
 }
 
 export interface Citation {
@@ -144,6 +145,13 @@ export interface ContentChunk {
     citation: Citation;
 }
 
+/** A table extracted from an HTML page. */
+export interface ExtractedTable {
+    headers: string[];
+    rows: string[][];
+    caption?: string;
+}
+
 export interface ScrapedPage {
     url: string;
     content: string; // Markdown content
@@ -154,6 +162,7 @@ export interface ScrapedPage {
     extracted?: Record<string, unknown>; // Structured data from extraction config
     screenshot?: string; // base64-encoded PNG screenshot (opt-in)
     pdf?: string; // base64-encoded PDF (opt-in)
+    tables?: ExtractedTable[]; // Extracted HTML tables (opt-in)
 }
 
 export interface RobotsConfig {
