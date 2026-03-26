@@ -4,6 +4,7 @@ import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
 import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks, ScrollConfig, ScrapeTarget, ScrapeManyOptions, ScrapeManyResult, ExtractedTable } from './types.js';
 import { extractTables } from './core/TableExtractor.js';
+import { markdownToCitations } from './core/Citations.js';
 import { extractCss, extractRegex } from './core/Extractor.js';
 import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog, isPrivateHost } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
@@ -36,6 +37,7 @@ interface NormalizedScrapeConfig {
     hooks?: ScrapeHooks;
     scroll?: ScrollConfig;
     tableExtraction?: boolean;
+    citations?: boolean;
 }
 
 /**
@@ -111,6 +113,7 @@ export class AgentCrawl {
                 ? (typeof config.scroll === 'boolean' ? { enabled: config.scroll } : config.scroll)
                 : undefined,
             tableExtraction: config.tableExtraction,
+            citations: config.citations,
         };
     }
 
@@ -201,7 +204,7 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks, scroll, tableExtraction } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks, scroll, tableExtraction, citations } = normalizedConfig;
         const hasResultModifyingHooks = !!(hooks?.onFetched || hooks?.onResult);
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
@@ -354,9 +357,12 @@ export class AgentCrawl {
             }
         }
 
+        // Convert inline links to numbered footnotes if requested
+        const finalMarkdown = citations ? markdownToCitations(extracted.markdown) : extracted.markdown;
+
         const result: ScrapedPage = {
             url: finalUrl,
-            content: extracted.markdown,
+            content: finalMarkdown,
             title: extracted.title,
             links: extracted.links,
             extracted: extractedData,
@@ -481,6 +487,7 @@ export class AgentCrawl {
             hooks: crawlHooks ? { onFetched: crawlHooks.onFetched, onResult: crawlHooks.onResult } : undefined,
             scroll: config.scroll,
             tableExtraction: config.tableExtraction,
+            citations: config.citations,
         };
 
         // Reject excessively long start URLs before any processing

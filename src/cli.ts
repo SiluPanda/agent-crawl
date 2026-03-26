@@ -30,6 +30,7 @@ Scrape options:
   --max-scrolls <n>        Max scroll iterations (default: 10)
   --scroll-delay <ms>      Delay between scrolls in ms (default: 500)
   --tables                 Extract HTML tables as structured data
+  --citations              Convert inline links to numbered footnotes
 
 Crawl options (in addition to scrape options):
   -d, --depth <n>          Max crawl depth (default: 1)
@@ -109,6 +110,7 @@ async function main() {
                 'max-scrolls': { type: 'string' },
                 'scroll-delay': { type: 'string' },
                 tables: { type: 'boolean', default: false },
+                citations: { type: 'boolean', default: false },
                 // Crawl-specific
                 depth: { type: 'string', short: 'd' },
                 pages: { type: 'string', short: 'n' },
@@ -172,6 +174,7 @@ async function main() {
     }
 
     if (v.tables) config.tableExtraction = true;
+    if (v.citations) config.citations = true;
 
     if (v['extract-css']) {
         try {

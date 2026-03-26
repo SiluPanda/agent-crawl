@@ -130,6 +130,7 @@ export interface ScrapeConfig {
     hooks?: ScrapeHooks; // lifecycle hooks for customization
     scroll?: boolean | ScrollConfig; // auto-scroll for lazy/infinite content (forces browser mode)
     tableExtraction?: boolean; // extract HTML tables as structured data
+    citations?: boolean; // convert inline links to numbered footnote references
 }
 
 export interface Citation {
