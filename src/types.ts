@@ -5,6 +5,8 @@ export interface FetchOptions {
     retries?: number;
     maxResponseBytes?: number;
     httpCache?: boolean | HttpCacheConfig;
+    proxy?: ProxyConfig;
+    cookies?: CookieDef[];
 }
 
 export interface FetchResult {
@@ -60,6 +62,21 @@ export interface RegexExtractionConfig {
 
 export type ExtractionConfig = CssExtractionConfig | RegexExtractionConfig;
 
+/** Proxy server configuration for routing requests through a proxy. */
+export interface ProxyConfig {
+    url: string; // e.g., http://proxy:8080, socks5://proxy:1080
+    username?: string;
+    password?: string;
+}
+
+/** A cookie to inject into requests. */
+export interface CookieDef {
+    name: string;
+    value: string;
+    domain?: string; // defaults to target URL hostname
+    path?: string; // defaults to "/"
+}
+
 export interface ScrapeConfig {
     mode?: 'static' | 'hybrid' | 'browser';
     waitFor?: string; // CSS selector to wait for (browser mode only)
@@ -72,6 +89,9 @@ export interface ScrapeConfig {
     httpCache?: boolean | HttpCacheConfig; // opt-in disk HTTP cache for static fetch
     chunking?: boolean | ChunkingConfig; // opt-in chunking for agent use
     extraction?: ExtractionConfig; // opt-in structured data extraction
+    proxy?: ProxyConfig; // route requests through a proxy server
+    headers?: Record<string, string>; // custom request headers (e.g., Authorization)
+    cookies?: CookieDef[]; // cookies to inject into requests
 }
 
 export interface Citation {

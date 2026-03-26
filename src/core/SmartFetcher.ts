@@ -1,4 +1,4 @@
-import { FetchOptions, FetchResult, HttpCacheConfig } from '../types.js';
+import { FetchOptions, FetchResult, HttpCacheConfig, ProxyConfig, CookieDef } from '../types.js';
 import { HttpDiskCache } from './HttpDiskCache.js';
 import { isPrivateHost } from './UrlUtils.js';
 import path from 'node:path';
@@ -230,12 +230,44 @@ export class SmartFetcher {
         return SmartFetcher.ACCEPT_CONTENT_TYPES.some((t) => ct === t) || ct === '';
     }
 
+    private static proxyAgentCache = new Map<string, any>();
+
+    private async getProxyDispatcher(proxy: ProxyConfig): Promise<any> {
+        const cacheKey = proxy.url;
+        const cached = SmartFetcher.proxyAgentCache.get(cacheKey);
+        if (cached) return cached;
+
+        try {
+            const { ProxyAgent } = await import('undici');
+            const opts: any = { uri: proxy.url };
+            if (proxy.username || proxy.password) {
+                opts.token = `Basic ${Buffer.from(`${proxy.username ?? ''}:${proxy.password ?? ''}`).toString('base64')}`;
+            }
+            const agent = new ProxyAgent(opts);
+            // Cap cache size
+            if (SmartFetcher.proxyAgentCache.size >= 20) {
+                const oldest = SmartFetcher.proxyAgentCache.keys().next().value;
+                if (oldest) SmartFetcher.proxyAgentCache.delete(oldest);
+            }
+            SmartFetcher.proxyAgentCache.set(cacheKey, agent);
+            return agent;
+        } catch {
+            throw new Error('Proxy support requires undici. Install it with: npm install undici');
+        }
+    }
+
+    private static formatCookieHeader(cookies: CookieDef[]): string {
+        return cookies
+            .map(c => `${c.name}=${c.value}`)
+            .join('; ');
+    }
+
     async fetch(url: string, options: FetchOptions = {}): Promise<FetchResult> {
         const rawRetries = options.retries ?? 2;
         const retries = Number.isFinite(rawRetries) ? Math.min(Math.max(0, rawRetries), 10) : 2;
         const rawTimeout = options.timeout ?? 10000;
         const timeout = Number.isFinite(rawTimeout) ? Math.min(Math.max(1000, rawTimeout), 120_000) : 10000;
-        const { maxResponseBytes, httpCache } = options;
+        const { maxResponseBytes, httpCache, proxy, cookies } = options;
 
         // Reject excessively long URLs to prevent memory waste in cache keys/parsing
         if (url.length > MAX_URL_LENGTH) {
@@ -308,6 +340,28 @@ export class SmartFetcher {
             }
         }
 
+        // Resolve proxy dispatcher once before the retry loop
+        let proxyDispatcher: any = undefined;
+        if (proxy) {
+            try {
+                proxyDispatcher = await this.getProxyDispatcher(proxy);
+            } catch (e) {
+                return {
+                    url,
+                    finalUrl: url,
+                    html: '',
+                    status: 0,
+                    headers: {},
+                    isStaticSuccess: false,
+                    needsBrowser: false,
+                    error: e instanceof Error ? e.message : 'Failed to create proxy agent',
+                };
+            }
+        }
+
+        // Format cookies as header value
+        const cookieHeader = cookies?.length ? SmartFetcher.formatCookieHeader(cookies) : undefined;
+
         const cache = this.httpCacheFromOptions(httpCache);
         // Look up cache once before retries — cache data doesn't change between attempts
         const cached = cache ? await cache.get(url) : null;
@@ -331,7 +385,7 @@ export class SmartFetcher {
                 for (let redirectCount = 0; redirectCount <= SmartFetcher.MAX_REDIRECTS; redirectCount++) {
                     // Only send conditional/custom headers on the initial request, not redirect hops
                     const isInitialRequest = redirectCount === 0;
-                    response = await fetch(currentUrl, {
+                    const fetchOptions: any = {
                         method: currentMethod,
                         headers: {
                             'User-Agent': ua,
@@ -340,10 +394,15 @@ export class SmartFetcher {
                             'Accept-Encoding': 'gzip, deflate, br',
                             ...(isInitialRequest ? conditionalHeaders : {}),
                             ...(isInitialRequest ? safeUserHeaders : {}),
+                            ...(isInitialRequest && cookieHeader ? { 'Cookie': cookieHeader } : {}),
                         },
                         signal: controller.signal,
                         redirect: 'manual',
-                    });
+                    };
+                    if (proxyDispatcher) {
+                        fetchOptions.dispatcher = proxyDispatcher;
+                    }
+                    response = await fetch(currentUrl, fetchOptions);
 
                     // Only follow standard redirect codes; skip 300 (Multiple Choices),
                     // 304 (Not Modified), 305 (Use Proxy), 306 (unused)

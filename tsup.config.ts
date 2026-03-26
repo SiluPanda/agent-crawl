@@ -13,6 +13,7 @@ export default defineConfig({
     external: [
         'cheerio',
         'playwright-core',
-        'zod'
+        'zod',
+        'undici',
     ],
 });

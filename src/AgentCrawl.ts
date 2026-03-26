@@ -2,7 +2,7 @@ import { SmartFetcher } from './core/SmartFetcher.js';
 import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
-import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig } from './types.js';
+import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef } from './types.js';
 import { extractCss, extractRegex } from './core/Extractor.js';
 import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog, isPrivateHost } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
@@ -25,6 +25,9 @@ interface NormalizedScrapeConfig {
     httpCache?: boolean | HttpCacheConfig;
     chunking?: boolean | ChunkingConfig;
     extraction?: ExtractionConfig;
+    proxy?: ProxyConfig;
+    headers?: Record<string, string>;
+    cookies?: CookieDef[];
 }
 
 /**
@@ -63,6 +66,10 @@ export class AgentCrawl {
             config.stealth ? '1' : '0',
             config.stealthLevel,
             config.waitFor || '',
+            // Include proxy/headers/cookies in cache key since they affect response content
+            config.proxy?.url || '',
+            config.headers ? JSON.stringify(config.headers) : '',
+            config.cookies?.length ? config.cookies.map(c => `${c.name}=${c.value}`).join(';') : '',
         ];
         return parts.join('\0');
     }
@@ -82,6 +89,9 @@ export class AgentCrawl {
             httpCache: config.httpCache,
             chunking: config.chunking,
             extraction: config.extraction,
+            proxy: config.proxy,
+            headers: config.headers,
+            cookies: config.cookies,
         };
     }
 
@@ -172,7 +182,7 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies } = normalizedConfig;
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
         const normalizedUrl = this.normalizeUrlForDedupe(url);
@@ -207,6 +217,9 @@ export class AgentCrawl {
             const result = await this.fetcher.fetch(url, {
                 maxResponseBytes,
                 httpCache,
+                headers: customHeaders,
+                proxy,
+                cookies,
             });
             status = result.status;
             headers = result.headers;
@@ -231,6 +244,9 @@ export class AgentCrawl {
                 const browserOptions: BrowserPageOptions = {
                     stealth,
                     stealthLevel,
+                    proxy,
+                    headers: customHeaders,
+                    cookies,
                 };
                 const browserResult = await this.browserManager.getPage(url, waitFor, browserOptions);
                 browserUsed = true;
@@ -375,6 +391,9 @@ export class AgentCrawl {
             httpCache: config.httpCache,
             chunking: config.chunking,
             extraction: config.extraction,
+            proxy: config.proxy,
+            headers: config.headers,
+            cookies: config.cookies,
         };
 
         // Reject excessively long start URLs before any processing

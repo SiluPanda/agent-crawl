@@ -56,6 +56,22 @@ export const ScrapeOptionsSchema = z.object({
             overlapTokens: z.number().int().min(0).max(50_000).optional(),
         }),
     ]).optional().describe('Opt-in token-aware chunking with citation anchors'),
+    proxy: z.object({
+        url: z.string().url().max(2000),
+        username: z.string().max(200).optional(),
+        password: z.string().max(200).optional(),
+    }).optional().describe('Proxy server configuration'),
+    headers: z.record(
+        z.string().max(200),
+        z.string().max(8192),
+    ).refine(obj => Object.keys(obj).length <= 50, 'Maximum 50 custom headers')
+     .optional().describe('Custom request headers (e.g., Authorization)'),
+    cookies: z.array(z.object({
+        name: z.string().max(200),
+        value: z.string().max(4096),
+        domain: z.string().max(500).optional(),
+        path: z.string().max(500).optional(),
+    })).max(100).optional().describe('Cookies to inject into requests (max 100)'),
     extraction: z.union([
         z.object({
             type: z.literal('css'),

@@ -1,5 +1,5 @@
 import { chromium, Browser, BrowserContext, BrowserContextOptions, Page, Route } from 'playwright-core';
-import { StealthLevel } from '../types.js';
+import { StealthLevel, ProxyConfig, CookieDef } from '../types.js';
 import { isPrivateHost, sanitizeUrlForLog } from './UrlUtils.js';
 
 export interface BrowserPageResult {
@@ -12,6 +12,9 @@ export interface BrowserPageResult {
 export interface BrowserPageOptions {
     stealth?: boolean;
     stealthLevel?: StealthLevel;
+    proxy?: ProxyConfig;
+    headers?: Record<string, string>;
+    cookies?: CookieDef[];
 }
 
 /**
@@ -187,16 +190,17 @@ export class BrowserManager {
     private async getPageImpl(url: string, waitForSelector?: string, options: BrowserPageOptions = {}): Promise<BrowserPageResult> {
         const stealth = options.stealth ?? false;
         const stealthLevel = options.stealthLevel ?? 'balanced';
+        const contextOpts = this.getContextOptions(options);
         let browser = await this.launch();
         let context: BrowserContext;
         try {
-            context = await browser.newContext(this.getContextOptions(stealth));
+            context = await browser.newContext(contextOpts);
         } catch {
             // Browser may have disconnected between launch() and newContext() — retry once
             this.browser = null;
             this.launchPromise = null;
             browser = await this.launch();
-            context = await browser.newContext(this.getContextOptions(stealth));
+            context = await browser.newContext(contextOpts);
         }
 
         this.clearIdleTimer(); // We are active
@@ -205,6 +209,19 @@ export class BrowserManager {
             if (stealth) {
                 await this.applyStealth(context, stealthLevel);
             }
+
+            // Inject cookies before page navigation
+            if (options.cookies?.length) {
+                const parsedUrl = new URL(url);
+                const playwrightCookies = options.cookies.map(c => ({
+                    name: c.name,
+                    value: c.value,
+                    domain: c.domain ?? parsedUrl.hostname,
+                    path: c.path ?? '/',
+                }));
+                await context.addCookies(playwrightCookies);
+            }
+
             const page = await context.newPage();
 
             // Set default timeout for all operations to prevent hangs
@@ -294,30 +311,48 @@ export class BrowserManager {
         }
     }
 
-    private getContextOptions(stealth: boolean): BrowserContextOptions {
-        if (!stealth) {
-            return {
+    private getContextOptions(options: BrowserPageOptions): BrowserContextOptions {
+        const stealth = options.stealth ?? false;
+        const proxy = options.proxy;
+        const customHeaders = options.headers;
+
+        const base: BrowserContextOptions = stealth
+            ? {
+                userAgent: this.STEALTH_USER_AGENT,
+                viewport: { width: 1366, height: 768 },
+                locale: 'en-US',
+                timezoneId: 'America/New_York',
+                colorScheme: 'light',
+                deviceScaleFactor: 1,
+                isMobile: false,
+                hasTouch: false,
+                extraHTTPHeaders: {
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'sec-ch-ua': this.STEALTH_SEC_CH_UA,
+                    'sec-ch-ua-mobile': '?0',
+                    'sec-ch-ua-platform': '"Windows"',
+                    'Upgrade-Insecure-Requests': '1',
+                },
+            }
+            : {
                 userAgent: this.DEFAULT_USER_AGENT,
+            };
+
+        // Merge custom headers into extraHTTPHeaders (custom headers take precedence)
+        if (customHeaders && Object.keys(customHeaders).length > 0) {
+            base.extraHTTPHeaders = { ...(base.extraHTTPHeaders ?? {}), ...customHeaders };
+        }
+
+        // Set proxy at context level
+        if (proxy) {
+            base.proxy = {
+                server: proxy.url,
+                ...(proxy.username ? { username: proxy.username } : {}),
+                ...(proxy.password ? { password: proxy.password } : {}),
             };
         }
 
-        return {
-            userAgent: this.STEALTH_USER_AGENT,
-            viewport: { width: 1366, height: 768 },
-            locale: 'en-US',
-            timezoneId: 'America/New_York',
-            colorScheme: 'light',
-            deviceScaleFactor: 1,
-            isMobile: false,
-            hasTouch: false,
-            extraHTTPHeaders: {
-                'Accept-Language': 'en-US,en;q=0.9',
-                'sec-ch-ua': this.STEALTH_SEC_CH_UA,
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-                'Upgrade-Insecure-Requests': '1',
-            },
-        };
+        return base;
     }
 
     private async applyStealth(context: BrowserContext, level: StealthLevel): Promise<void> {
