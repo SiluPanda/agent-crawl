@@ -2,7 +2,7 @@ import { SmartFetcher } from './core/SmartFetcher.js';
 import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
-import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef } from './types.js';
+import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks } from './types.js';
 import { extractCss, extractRegex } from './core/Extractor.js';
 import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog, isPrivateHost } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
@@ -32,6 +32,7 @@ interface NormalizedScrapeConfig {
     jsCode?: string[];
     screenshot?: boolean;
     pdf?: boolean;
+    hooks?: ScrapeHooks;
 }
 
 /**
@@ -102,6 +103,7 @@ export class AgentCrawl {
                 : undefined,
             screenshot: config.screenshot,
             pdf: config.pdf,
+            hooks: config.hooks,
         };
     }
 
@@ -192,24 +194,28 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks } = normalizedConfig;
+        const hasResultModifyingHooks = !!(hooks?.onFetched || hooks?.onResult);
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
         const normalizedUrl = this.normalizeUrlForDedupe(url);
 
         // Check Cache first to avoid unnecessary network requests
+        // Skip cache when result-modifying hooks are present (they may produce different output)
         const cacheKey = this.getCacheKey(normalizedUrl, normalizedConfig);
-        const cached = this.cache.get(cacheKey);
-        if (cached) {
-            return cached;
-        }
+        if (!hasResultModifyingHooks) {
+            const cached = this.cache.get(cacheKey);
+            if (cached) {
+                return cached;
+            }
 
-        const diskCache = this.diskCacheFromConfig<ScrapedPage>(cache, 'scrape');
-        if (diskCache) {
-            const diskHit = await diskCache.get(cacheKey);
-            if (diskHit) {
-                this.cache.set(cacheKey, diskHit);
-                return diskHit;
+            const diskCache = this.diskCacheFromConfig<ScrapedPage>(cache, 'scrape');
+            if (diskCache) {
+                const diskHit = await diskCache.get(cacheKey);
+                if (diskHit) {
+                    this.cache.set(cacheKey, diskHit);
+                    return diskHit;
+                }
             }
         }
 
@@ -298,6 +304,16 @@ export class AgentCrawl {
             return this.toErrorPage(url, 'No HTML content was fetched', status, headers);
         }
 
+        // Hook: onFetched — allows modifying raw HTML before extraction
+        if (hooks?.onFetched) {
+            try {
+                const modified = await hooks.onFetched({ url: finalUrl, html, status, headers });
+                if (typeof modified === 'string') html = modified;
+            } catch (e) {
+                console.warn(`[AgentCrawl] onFetched hook error: ${e instanceof Error ? e.message.slice(0, 200) : 'Unknown'}`);
+            }
+        }
+
         // 3. Extract all content in a single pass (optimized - parses HTML only once)
         // This extracts title, links, and converts to markdown efficiently
         const extracted = this.markdownifier.extractAll(html, finalUrl, {
@@ -355,13 +371,29 @@ export class AgentCrawl {
             result.chunks = chunkMarkdown(result.content, { url: result.url, maxTokens, overlapTokens });
         }
 
-        // Cache the result to speed up subsequent requests
-        this.cache.set(cacheKey, result);
-        if (diskCache) {
-            await diskCache.set(cacheKey, result).catch(() => {});
+        // Hook: onResult — allows modifying the final ScrapedPage
+        let finalResult: ScrapedPage = result;
+        if (hooks?.onResult) {
+            try {
+                const modified = await hooks.onResult(result);
+                if (modified && typeof modified === 'object' && 'url' in modified && 'content' in modified) {
+                    finalResult = modified;
+                }
+            } catch (e) {
+                console.warn(`[AgentCrawl] onResult hook error: ${e instanceof Error ? e.message.slice(0, 200) : 'Unknown'}`);
+            }
         }
 
-        return result;
+        // Cache the result to speed up subsequent requests
+        if (!hasResultModifyingHooks) {
+            this.cache.set(cacheKey, finalResult);
+            const diskCache = this.diskCacheFromConfig<ScrapedPage>(cache, 'scrape');
+            if (diskCache) {
+                await diskCache.set(cacheKey, finalResult).catch(() => {});
+            }
+        }
+
+        return finalResult;
     }
 
     /**
@@ -384,6 +416,7 @@ export class AgentCrawl {
         const excludePatterns = config.excludePatterns ?? [];
         const strategy = config.strategy ?? 'bfs';
         const priorityKeywords = config.priorityKeywords ?? [];
+        const crawlHooks = config.hooks as CrawlHooks | undefined;
 
         const robotsCfg = typeof config.robots === 'boolean' ? { enabled: config.robots } : (config.robots ?? {});
         const robotsEnabled = robotsCfg.enabled === true;
@@ -424,6 +457,8 @@ export class AgentCrawl {
             jsCode: config.jsCode,
             screenshot: config.screenshot,
             pdf: config.pdf,
+            // Pass scrape-level hooks (onFetched, onResult) but not crawl-specific ones
+            hooks: crawlHooks ? { onFetched: crawlHooks.onFetched, onResult: crawlHooks.onResult } : undefined,
         };
 
         // Reject excessively long start URLs before any processing
@@ -740,6 +775,11 @@ export class AgentCrawl {
                         pages.push(page);
                         maxDepthReached = Math.max(maxDepthReached, depth);
 
+                        // Hook: onPageCrawled — notify after each successful page
+                        if (crawlHooks?.onPageCrawled) {
+                            try { await crawlHooks.onPageCrawled(page, depth); } catch { /* non-fatal */ }
+                        }
+
                         // Add discovered links to queue (if not at max depth)
                         if (depth < maxDepth && page.links) {
                             for (const link of page.links) {
@@ -748,6 +788,13 @@ export class AgentCrawl {
                                 const normalizedLink = this.normalizeUrlForDedupe(link);
                                 // Only add same-origin links that aren't visited or already queued
                                 if (shouldQueue(normalizedLink) && !visited.has(normalizedLink) && !queued.has(normalizedLink)) {
+                                    // Hook: shouldCrawlUrl — custom URL filtering
+                                    if (crawlHooks?.shouldCrawlUrl) {
+                                        try {
+                                            const allowed = await crawlHooks.shouldCrawlUrl(normalizedLink, depth + 1);
+                                            if (!allowed) continue;
+                                        } catch { /* on error, allow the URL */ }
+                                    }
                                     const score = strategy === 'bestfirst' ? scoreUrl(normalizedLink, priorityKeywords) : undefined;
                                     crawlQueue.push({ url: normalizedLink, depth: depth + 1, score });
                                     queued.add(normalizedLink);

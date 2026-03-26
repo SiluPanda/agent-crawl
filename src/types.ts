@@ -77,6 +77,30 @@ export interface CookieDef {
     path?: string; // defaults to "/"
 }
 
+/** Context passed to the onFetched hook. */
+export interface FetchedContext {
+    url: string;
+    html: string;
+    status: number;
+    headers: Record<string, string>;
+}
+
+/** Hooks for customizing the scrape lifecycle. */
+export interface ScrapeHooks {
+    /** Called after HTML is fetched, before markdown conversion. Return modified HTML or void to keep original. */
+    onFetched?: (ctx: FetchedContext) => string | void | Promise<string | void>;
+    /** Called on the final ScrapedPage before caching/returning. Return modified page or void to keep original. */
+    onResult?: (page: ScrapedPage) => ScrapedPage | void | Promise<ScrapedPage | void>;
+}
+
+/** Hooks for customizing the crawl lifecycle. Extends scrape hooks. */
+export interface CrawlHooks extends ScrapeHooks {
+    /** Called before a discovered URL is queued. Return false to skip it. */
+    shouldCrawlUrl?: (url: string, depth: number) => boolean | Promise<boolean>;
+    /** Called after each page is successfully crawled. */
+    onPageCrawled?: (page: ScrapedPage, depth: number) => void | Promise<void>;
+}
+
 export interface ScrapeConfig {
     mode?: 'static' | 'hybrid' | 'browser';
     waitFor?: string; // CSS selector to wait for (browser mode only)
@@ -95,6 +119,7 @@ export interface ScrapeConfig {
     jsCode?: string | string[]; // JS to execute after page load (forces browser mode)
     screenshot?: boolean; // capture full-page screenshot as base64 PNG (forces browser mode)
     pdf?: boolean; // capture page as base64 PDF (forces browser mode)
+    hooks?: ScrapeHooks; // lifecycle hooks for customization
 }
 
 export interface Citation {
@@ -157,6 +182,7 @@ export interface CrawlConfig extends ScrapeConfig {
     crawlState?: boolean | CrawlStateConfig; // opt-in resumable crawl state
     strategy?: CrawlStrategy; // crawl traversal strategy (default: 'bfs')
     priorityKeywords?: string[]; // for bestfirst strategy — URLs containing these score higher
+    hooks?: CrawlHooks; // lifecycle hooks for customization (extends ScrapeHooks)
 }
 
 export interface CrawlResult {
