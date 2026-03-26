@@ -133,6 +133,8 @@ export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({
             persistPages: z.boolean().optional(),
         }),
     ]).optional().describe('Opt-in resumable crawl state persistence'),
+    strategy: z.enum(['bfs', 'dfs', 'bestfirst']).default('bfs').describe('Crawl traversal strategy'),
+    priorityKeywords: z.array(z.string().max(200)).max(50).optional().describe('Keywords for bestfirst strategy — URLs containing these score higher'),
 });
 
 export type ScrapeOptions = z.infer<typeof ScrapeOptionsSchema>;

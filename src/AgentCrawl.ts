@@ -9,6 +9,7 @@ import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
 import { HostScheduler } from './core/HostScheduler.js';
 import { DiskKv } from './core/DiskKv.js';
 import { chunkMarkdown } from './core/Chunker.js';
+import { createCrawlQueue, scoreUrl, type ICrawlQueue, type QueueItem } from './core/CrawlQueue.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -381,6 +382,8 @@ export class AgentCrawl {
         const perHostConcurrency = Math.min(Math.max(1, this.finiteOr(config.perHostConcurrency, concurrency)), concurrency);
         const includePatterns = config.includePatterns ?? [];
         const excludePatterns = config.excludePatterns ?? [];
+        const strategy = config.strategy ?? 'bfs';
+        const priorityKeywords = config.priorityKeywords ?? [];
 
         const robotsCfg = typeof config.robots === 'boolean' ? { enabled: config.robots } : (config.robots ?? {});
         const robotsEnabled = robotsCfg.enabled === true;
@@ -508,7 +511,7 @@ export class AgentCrawl {
 
         const MAX_STATE_BYTES = 100 * 1024 * 1024; // 100MB cap for state file
         const MAX_RESTORED_CONTENT_LENGTH = 5 * 1024 * 1024; // 5MB cap per restored page content
-        let queue: Array<{ url: string; depth: number }> = [];
+        const crawlQueue: ICrawlQueue = createCrawlQueue(strategy);
         const statePath = stateEnabled ? this.crawlStatePath(startUrl, stateCfg) : null;
         // Clean up stale .tmp files from crashed writes in the state directory
         if (stateEnabled && statePath) {
@@ -594,7 +597,8 @@ export class AgentCrawl {
                             && Number.isFinite(item.depth) && item.depth >= 0) {
                             // Re-validate restored items against current robots.txt, patterns, and origin
                             if (!visited.has(item.url) && shouldQueue(item.url) && item.depth <= maxDepth) {
-                                queue.push(item);
+                                const score = strategy === 'bestfirst' ? scoreUrl(item.url, priorityKeywords) : undefined;
+                                crawlQueue.push({ url: item.url, depth: item.depth, score });
                                 queued.add(item.url);
                             }
                         }
@@ -606,12 +610,11 @@ export class AgentCrawl {
             }
         }
 
-        // BFS queue: { url, depth } — use index cursor instead of shift() for O(1) dequeue
-        let queueHead = 0;
         const normalizedStartUrl = this.normalizeUrlForDedupe(startUrl);
         if (shouldQueue(normalizedStartUrl)) {
             if (!queued.has(normalizedStartUrl) && !visited.has(normalizedStartUrl)) {
-                queue.push({ url: normalizedStartUrl, depth: 0 });
+                const score = strategy === 'bestfirst' ? scoreUrl(normalizedStartUrl, priorityKeywords) : undefined;
+                crawlQueue.push({ url: normalizedStartUrl, depth: 0, score });
             }
         } else if (!visited.has(normalizedStartUrl)) {
             // Start URL failed pattern/robots filters — report so the caller knows
@@ -628,10 +631,11 @@ export class AgentCrawl {
                         s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
                     const locs = Array.from(res.html.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)).map((m) => decodeXmlEntities(m[1]));
                     for (const loc of locs.slice(0, sitemapMaxUrls)) {
-                        if ((queue.length - queueHead) >= maxQueueSize) break;
+                        if (crawlQueue.length >= maxQueueSize) break;
                         const normalized = this.normalizeUrlForDedupe(loc);
                         if (shouldQueue(normalized) && !queued.has(normalized) && !visited.has(normalized)) {
-                            queue.push({ url: normalized, depth: 0 });
+                            const score = strategy === 'bestfirst' ? scoreUrl(normalized, priorityKeywords) : undefined;
+                            crawlQueue.push({ url: normalized, depth: 0, score });
                             queued.add(normalized);
                         }
                     }
@@ -653,7 +657,7 @@ export class AgentCrawl {
                     version: 1,
                     startUrl,
                     baseOrigin,
-                    queue: queue.slice(queueHead),
+                    queue: crawlQueue.toArray(),
                     visited: Array.from(visited),
                     queued: Array.from(queued),
                     pages: stateCfg.persistPages ? pages : [],
@@ -683,11 +687,11 @@ export class AgentCrawl {
         };
 
         let batches = 0;
-        while (queueHead < queue.length && pages.length < maxPages) {
+        while (crawlQueue.length > 0 && pages.length < maxPages) {
             // Take a batch of URLs up to concurrency limit
             const batch: Array<{ url: string; depth: number }> = [];
-            while (batch.length < concurrency && queueHead < queue.length && (pages.length + batch.length) < maxPages) {
-                const item = queue[queueHead++];
+            while (batch.length < concurrency && crawlQueue.length > 0 && (pages.length + batch.length) < maxPages) {
+                const item = crawlQueue.shift()!;
                 queued.delete(item.url);
 
                 // Skip if already visited
@@ -739,12 +743,13 @@ export class AgentCrawl {
                         // Add discovered links to queue (if not at max depth)
                         if (depth < maxDepth && page.links) {
                             for (const link of page.links) {
-                                if ((queue.length - queueHead) >= maxQueueSize) break;
+                                if (crawlQueue.length >= maxQueueSize) break;
                                 if (visited.size >= maxVisitedSize) break;
                                 const normalizedLink = this.normalizeUrlForDedupe(link);
                                 // Only add same-origin links that aren't visited or already queued
                                 if (shouldQueue(normalizedLink) && !visited.has(normalizedLink) && !queued.has(normalizedLink)) {
-                                    queue.push({ url: normalizedLink, depth: depth + 1 });
+                                    const score = strategy === 'bestfirst' ? scoreUrl(normalizedLink, priorityKeywords) : undefined;
+                                    crawlQueue.push({ url: normalizedLink, depth: depth + 1, score });
                                     queued.add(normalizedLink);
                                 }
                             }
@@ -764,13 +769,6 @@ export class AgentCrawl {
             }
 
             batches++;
-
-            // Compact the queue array periodically to release consumed entries.
-            // Use slice (creates new array for GC) instead of splice (O(n) in-place shift).
-            if (queueHead > 10_000) {
-                queue = queue.slice(queueHead);
-                queueHead = 0;
-            }
 
             if (stateEnabled && (batches % stateCfg.flushEvery! === 0)) {
                 await persistState().catch(() => {});

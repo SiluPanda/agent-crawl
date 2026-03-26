@@ -142,6 +142,8 @@ export interface CrawlStateConfig {
     persistPages?: boolean; // default: true
 }
 
+export type CrawlStrategy = 'bfs' | 'dfs' | 'bestfirst';
+
 export interface CrawlConfig extends ScrapeConfig {
     maxDepth?: number;    // Maximum depth to crawl (default: 1)
     maxPages?: number;    // Maximum number of pages to crawl (default: 10)
@@ -153,6 +155,8 @@ export interface CrawlConfig extends ScrapeConfig {
     robots?: boolean | RobotsConfig; // opt-in
     sitemap?: boolean | SitemapConfig; // opt-in
     crawlState?: boolean | CrawlStateConfig; // opt-in resumable crawl state
+    strategy?: CrawlStrategy; // crawl traversal strategy (default: 'bfs')
+    priorityKeywords?: string[]; // for bestfirst strategy — URLs containing these score higher
 }
 
 export interface CrawlResult {
