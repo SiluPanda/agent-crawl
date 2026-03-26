@@ -29,6 +29,8 @@ interface NormalizedScrapeConfig {
     headers?: Record<string, string>;
     cookies?: CookieDef[];
     jsCode?: string[];
+    screenshot?: boolean;
+    pdf?: boolean;
 }
 
 /**
@@ -97,6 +99,8 @@ export class AgentCrawl {
             jsCode: config.jsCode
                 ? (Array.isArray(config.jsCode) ? config.jsCode : [config.jsCode]).filter(s => s.trim())
                 : undefined,
+            screenshot: config.screenshot,
+            pdf: config.pdf,
         };
     }
 
@@ -187,7 +191,7 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf } = normalizedConfig;
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
         const normalizedUrl = this.normalizeUrlForDedupe(url);
@@ -213,17 +217,20 @@ export class AgentCrawl {
         let headers: Record<string, string> = {};
         let finalUrl = url;
         let browserUsed = false;
+        let screenshotB64: string | undefined;
+        let pdfB64: string | undefined;
         let staticError: string | null = null;
         let shouldUseBrowserFallback = mode === 'browser';
 
-        // jsCode requires browser — force browser mode
-        if (jsCode?.length) {
+        // jsCode/screenshot/pdf require browser — force browser mode
+        const needsBrowser = !!(jsCode?.length || screenshot || pdf);
+        if (needsBrowser) {
             shouldUseBrowserFallback = true;
         }
 
-        // 1. Try Static Fetch (if mode is static or hybrid, and no jsCode)
+        // 1. Try Static Fetch (if mode is static or hybrid, and no browser-only features)
         // This is much faster and cheaper than spinning up a browser
-        if ((mode === 'static' || mode === 'hybrid') && !jsCode?.length) {
+        if ((mode === 'static' || mode === 'hybrid') && !needsBrowser) {
             const result = await this.fetcher.fetch(url, {
                 maxResponseBytes,
                 httpCache,
@@ -258,6 +265,8 @@ export class AgentCrawl {
                     headers: customHeaders,
                     cookies,
                     jsCode,
+                    screenshot,
+                    pdf,
                 };
                 const browserResult = await this.browserManager.getPage(url, waitFor, browserOptions);
                 browserUsed = true;
@@ -265,6 +274,8 @@ export class AgentCrawl {
                 status = browserResult.status;
                 headers = browserResult.headers;
                 finalUrl = browserResult.finalUrl ?? finalUrl;
+                screenshotB64 = browserResult.screenshot;
+                pdfB64 = browserResult.pdf;
 
                 if (status < 200 || status >= 300) {
                     return this.toErrorPage(url, `Browser fetch returned HTTP ${status}`, status, headers);
@@ -313,6 +324,8 @@ export class AgentCrawl {
             title: extracted.title,
             links: extracted.links,
             extracted: extractedData,
+            screenshot: screenshotB64,
+            pdf: pdfB64,
             metadata: (() => {
                 // Place response headers under a dedicated key to prevent
                 // server-controlled header names from overwriting reserved fields
@@ -406,6 +419,8 @@ export class AgentCrawl {
             headers: config.headers,
             cookies: config.cookies,
             jsCode: config.jsCode,
+            screenshot: config.screenshot,
+            pdf: config.pdf,
         };
 
         // Reject excessively long start URLs before any processing

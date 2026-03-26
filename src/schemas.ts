@@ -95,6 +95,8 @@ export const ScrapeOptionsSchema = z.object({
         z.string().max(51200),
         z.array(z.string().max(51200)).max(10),
     ]).optional().describe('JavaScript to execute after page load (forces browser mode, max 50KB per script, max 10 scripts)'),
+    screenshot: z.boolean().optional().describe('Capture full-page screenshot as base64 PNG (forces browser mode)'),
+    pdf: z.boolean().optional().describe('Capture page as base64 PDF (forces browser mode)'),
 });
 
 export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({

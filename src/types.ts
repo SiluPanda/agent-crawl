@@ -93,6 +93,8 @@ export interface ScrapeConfig {
     headers?: Record<string, string>; // custom request headers (e.g., Authorization)
     cookies?: CookieDef[]; // cookies to inject into requests
     jsCode?: string | string[]; // JS to execute after page load (forces browser mode)
+    screenshot?: boolean; // capture full-page screenshot as base64 PNG (forces browser mode)
+    pdf?: boolean; // capture page as base64 PDF (forces browser mode)
 }
 
 export interface Citation {
@@ -116,6 +118,8 @@ export interface ScrapedPage {
     links?: string[]; // Extracted links from this page
     chunks?: ContentChunk[]; // Optional token-aware chunks (opt-in)
     extracted?: Record<string, unknown>; // Structured data from extraction config
+    screenshot?: string; // base64-encoded PNG screenshot (opt-in)
+    pdf?: string; // base64-encoded PDF (opt-in)
 }
 
 export interface RobotsConfig {

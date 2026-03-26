@@ -7,6 +7,8 @@ export interface BrowserPageResult {
     status: number;
     headers: Record<string, string>;
     finalUrl?: string;
+    screenshot?: string;
+    pdf?: string;
 }
 
 export interface BrowserPageOptions {
@@ -16,6 +18,8 @@ export interface BrowserPageOptions {
     headers?: Record<string, string>;
     cookies?: CookieDef[];
     jsCode?: string[];
+    screenshot?: boolean;
+    pdf?: boolean;
 }
 
 /**
@@ -115,6 +119,8 @@ export class BrowserManager {
     private static readonly MAX_CONCURRENT_PAGES = 10; // Limit concurrent browser contexts to prevent OOM
     private static readonly MAX_RESPONSE_HEADERS = 200;
     private static readonly MAX_HEADER_VALUE_LEN = 8192;
+    private static readonly MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024; // 10MB cap
+    private static readonly MAX_PDF_BYTES = 20 * 1024 * 1024; // 20MB cap
 
     async getPage(url: string, waitForSelector?: string, options: BrowserPageOptions = {}): Promise<BrowserPageResult> {
         if (url.length > 8192) {
@@ -311,11 +317,39 @@ export class BrowserManager {
                     ? v.slice(0, BrowserManager.MAX_HEADER_VALUE_LEN) : String(v);
                 hdrCount++;
             }
+            // Capture screenshot/PDF if requested (after all JS and content extraction)
+            let screenshotB64: string | undefined;
+            let pdfB64: string | undefined;
+
+            if (options.screenshot) {
+                try {
+                    const buf = await page.screenshot({ fullPage: true, timeout: 15000 });
+                    if (buf.byteLength <= BrowserManager.MAX_SCREENSHOT_BYTES) {
+                        screenshotB64 = buf.toString('base64');
+                    }
+                } catch {
+                    // Screenshot failure is non-fatal
+                }
+            }
+
+            if (options.pdf) {
+                try {
+                    const buf = await page.pdf({ timeout: 15000 });
+                    if (buf.byteLength <= BrowserManager.MAX_PDF_BYTES) {
+                        pdfB64 = buf.toString('base64');
+                    }
+                } catch {
+                    // PDF failure is non-fatal (e.g. headed mode doesn't support pdf)
+                }
+            }
+
             return {
                 html: content,
                 status: response?.status() ?? 200,
                 headers: cappedHeaders,
                 finalUrl,
+                screenshot: screenshotB64,
+                pdf: pdfB64,
             };
         } catch (e: any) {
             const errDetail = e instanceof Error ? e.message : String(e);
