@@ -2,7 +2,7 @@ import { SmartFetcher } from './core/SmartFetcher.js';
 import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
-import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks, ScrollConfig } from './types.js';
+import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks, ScrollConfig, ScrapeTarget, ScrapeManyOptions, ScrapeManyResult } from './types.js';
 import { extractCss, extractRegex } from './core/Extractor.js';
 import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog, isPrivateHost } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
@@ -839,6 +839,64 @@ export class AgentCrawl {
             maxDepthReached,
             errors,
         };
+    }
+
+    /**
+     * Scrape multiple URLs concurrently with configurable concurrency.
+     * Returns results in the same order as the input URLs.
+     */
+    static async scrapeMany(
+        targets: string[] | ScrapeTarget[],
+        sharedConfig?: ScrapeConfig,
+        options?: ScrapeManyOptions,
+    ): Promise<ScrapeManyResult> {
+        const concurrency = Math.min(Math.max(1, options?.concurrency ?? 5), 50);
+        const onProgress = options?.onProgress;
+
+        // Normalize targets
+        const normalized: ScrapeTarget[] = targets.map(t =>
+            typeof t === 'string' ? { url: t } : t,
+        );
+
+        if (normalized.length === 0) {
+            return { pages: [], totalPages: 0, errors: [] };
+        }
+
+        const results: (ScrapedPage | null)[] = new Array(normalized.length).fill(null);
+        const errors: Array<{ url: string; error: string }> = [];
+        let activeCount = 0;
+        let nextIndex = 0;
+
+        const processNext = async (): Promise<void> => {
+            while (nextIndex < normalized.length) {
+                const idx = nextIndex++;
+                const target = normalized[idx];
+                const mergedConfig: ScrapeConfig = { ...sharedConfig, ...target.config };
+
+                try {
+                    const page = await this.scrape(target.url, mergedConfig);
+                    results[idx] = page;
+                    if (page.metadata?.error) {
+                        errors.push({ url: target.url, error: page.metadata.error });
+                    }
+                    if (onProgress) {
+                        try { onProgress(page, idx); } catch { /* non-fatal */ }
+                    }
+                } catch (e) {
+                    const msg = e instanceof Error ? e.message : 'Unknown error';
+                    const errorPage = this.toErrorPage(target.url, msg);
+                    results[idx] = errorPage;
+                    errors.push({ url: target.url, error: msg.slice(0, this.MAX_ERROR_LENGTH) });
+                }
+            }
+        };
+
+        // Launch concurrent workers
+        const workers = Array.from({ length: Math.min(concurrency, normalized.length) }, () => processNext());
+        await Promise.all(workers);
+
+        const pages = results.filter((p): p is ScrapedPage => p !== null);
+        return { pages, totalPages: pages.length, errors };
     }
 
     /**

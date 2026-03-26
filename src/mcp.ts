@@ -2,7 +2,7 @@ import { createInterface } from 'node:readline';
 import { AgentCrawl } from './AgentCrawl.js';
 import type { ScrapeConfig, CrawlConfig } from './types.js';
 
-const SERVER_INFO = { name: 'agent-crawl', version: '3.9.0' };
+const SERVER_INFO = { name: 'agent-crawl', version: '3.10.0' };
 const PROTOCOL_VERSION = '2024-11-05';
 
 const TOOLS = [
@@ -59,6 +59,20 @@ const TOOLS = [
                 regexPatterns: { type: 'object', description: 'Regex extraction patterns — keys are field names, values are regex pattern strings' },
             },
             required: ['url'],
+        },
+    },
+    {
+        name: 'scrape_many',
+        description: 'Scrape multiple URLs concurrently and return all results. Useful for batch processing lists of pages.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                urls: { type: 'array', items: { type: 'string' }, description: 'List of URLs to scrape' },
+                concurrency: { type: 'number', description: 'Max concurrent scrapes (default: 5)' },
+                extractMainContent: { type: 'boolean', description: 'Extract only main content per page' },
+                mode: { type: 'string', enum: ['static', 'hybrid', 'browser'], description: 'Fetch mode (default: hybrid)' },
+            },
+            required: ['urls'],
         },
     },
 ];
@@ -153,6 +167,25 @@ async function handleToolCall(name: string, args: Record<string, unknown>): Prom
             }
 
             return { content: [{ type: 'text', text: JSON.stringify(page.extracted ?? {}, null, 2) }] };
+        }
+
+        if (name === 'scrape_many') {
+            const urls = args.urls as string[];
+            if (!urls?.length) return { content: [{ type: 'text', text: 'Missing required parameter: urls (array)' }], isError: true };
+
+            const config: ScrapeConfig = {};
+            if (args.mode) config.mode = args.mode as ScrapeConfig['mode'];
+            if (args.extractMainContent) config.extractMainContent = true;
+
+            const result = await AgentCrawl.scrapeMany(urls, config, {
+                concurrency: (args.concurrency as number) || 5,
+            });
+
+            const text = result.pages.map(p =>
+                `--- ${p.url} ---\n${p.content}`
+            ).join('\n\n') + `\n\n[Scraped ${result.totalPages} pages, ${result.errors.length} errors]`;
+
+            return { content: [{ type: 'text', text }] };
         }
 
         return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };

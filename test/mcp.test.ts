@@ -60,7 +60,8 @@ test('MCP: tools/list returns scrape, crawl, extract', () => {
     assert.ok(names.includes('scrape'));
     assert.ok(names.includes('crawl'));
     assert.ok(names.includes('extract'));
-    assert.equal(resp.result.tools.length, 3);
+    assert.ok(names.includes('scrape_many'));
+    assert.equal(resp.result.tools.length, 4);
 });
 
 test('MCP: tools have valid inputSchema with required fields', () => {
@@ -71,7 +72,7 @@ test('MCP: tools have valid inputSchema with required fields', () => {
     for (const tool of resp.result.tools) {
         assert.ok(tool.inputSchema);
         assert.equal(tool.inputSchema.type, 'object');
-        assert.ok(tool.inputSchema.required.includes('url'));
+        assert.ok(tool.inputSchema.required.length > 0);
         assert.ok(tool.description.length > 10);
     }
 });
@@ -222,7 +223,7 @@ test('MCP: multiple calls in sequence', () => {
     assert.ok(init?.result?.serverInfo);
 
     const list = parseResponse(lines, 2);
-    assert.ok(list?.result?.tools?.length === 3);
+    assert.ok(list?.result?.tools?.length === 4);
 
     const scrape = parseResponse(lines, 3);
     assert.ok(scrape?.result?.content?.[0]?.text?.includes('Example Domain'));

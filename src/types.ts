@@ -200,3 +200,22 @@ export interface CrawlResult {
     maxDepthReached: number;
     errors: Array<{ url: string; error: string }>;
 }
+
+/** A scrape target for batch scraping. */
+export interface ScrapeTarget {
+    url: string;
+    config?: ScrapeConfig; // per-URL config override
+}
+
+/** Options for AgentCrawl.scrapeMany(). */
+export interface ScrapeManyOptions {
+    concurrency?: number; // max concurrent scrapes (default: 5, max: 50)
+    onProgress?: (page: ScrapedPage, index: number) => void; // called as each page completes
+}
+
+/** Result of AgentCrawl.scrapeMany(). */
+export interface ScrapeManyResult {
+    pages: ScrapedPage[];
+    totalPages: number;
+    errors: Array<{ url: string; error: string }>;
+}
