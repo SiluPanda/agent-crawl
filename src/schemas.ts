@@ -97,6 +97,15 @@ export const ScrapeOptionsSchema = z.object({
     ]).optional().describe('JavaScript to execute after page load (forces browser mode, max 50KB per script, max 10 scripts)'),
     screenshot: z.boolean().optional().describe('Capture full-page screenshot as base64 PNG (forces browser mode)'),
     pdf: z.boolean().optional().describe('Capture page as base64 PDF (forces browser mode)'),
+    scroll: z.union([
+        z.boolean(),
+        z.object({
+            enabled: z.boolean().optional(),
+            maxScrolls: z.number().int().min(1).max(100).optional(),
+            scrollDelay: z.number().int().min(100).max(10_000).optional(),
+            selector: z.string().max(500).optional(),
+        }),
+    ]).optional().describe('Auto-scroll for lazy/infinite content loading (forces browser mode)'),
 });
 
 export const CrawlOptionsSchema = ScrapeOptionsSchema.extend({

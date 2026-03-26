@@ -2,7 +2,7 @@ import { SmartFetcher } from './core/SmartFetcher.js';
 import { Markdownifier } from './cleaners/Markdownifier.js';
 import { BrowserManager, BrowserPageOptions } from './core/BrowserManager.js';
 import { CacheManager } from './core/CacheManager.js';
-import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks } from './types.js';
+import { ScrapeConfig, ScrapedPage, CrawlConfig, CrawlResult, StealthLevel, DiskCacheConfig, HttpCacheConfig, ChunkingConfig, CrawlStateConfig, ExtractionConfig, ProxyConfig, CookieDef, ScrapeHooks, CrawlHooks, ScrollConfig } from './types.js';
 import { extractCss, extractRegex } from './core/Extractor.js';
 import { normalizeUrl, safeHttpUrl, sanitizeUrlForLog, isPrivateHost } from './core/UrlUtils.js';
 import { fetchRobotsTxt, isAllowedByRobots, RobotsTxt } from './core/Robots.js';
@@ -33,6 +33,7 @@ interface NormalizedScrapeConfig {
     screenshot?: boolean;
     pdf?: boolean;
     hooks?: ScrapeHooks;
+    scroll?: ScrollConfig;
 }
 
 /**
@@ -104,6 +105,9 @@ export class AgentCrawl {
             screenshot: config.screenshot,
             pdf: config.pdf,
             hooks: config.hooks,
+            scroll: config.scroll
+                ? (typeof config.scroll === 'boolean' ? { enabled: config.scroll } : config.scroll)
+                : undefined,
         };
     }
 
@@ -194,7 +198,7 @@ export class AgentCrawl {
         }
 
         const normalizedConfig = this.normalizeScrapeConfig(config);
-        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks } = normalizedConfig;
+        const { mode, waitFor, extractMainContent, optimizeTokens, stealth, stealthLevel, maxResponseBytes, cache, httpCache, chunking, extraction, proxy, headers: customHeaders, cookies, jsCode, screenshot, pdf, hooks, scroll } = normalizedConfig;
         const hasResultModifyingHooks = !!(hooks?.onFetched || hooks?.onResult);
 
         // Normalize URL for cache key to avoid duplicate scrapes for equivalent URLs
@@ -229,8 +233,9 @@ export class AgentCrawl {
         let staticError: string | null = null;
         let shouldUseBrowserFallback = mode === 'browser';
 
-        // jsCode/screenshot/pdf require browser — force browser mode
-        const needsBrowser = !!(jsCode?.length || screenshot || pdf);
+        // jsCode/screenshot/pdf/scroll require browser — force browser mode
+        const scrollEnabled = scroll?.enabled !== false && !!scroll;
+        const needsBrowser = !!(jsCode?.length || screenshot || pdf || scrollEnabled);
         if (needsBrowser) {
             shouldUseBrowserFallback = true;
         }
@@ -274,6 +279,7 @@ export class AgentCrawl {
                     jsCode,
                     screenshot,
                     pdf,
+                    scroll,
                 };
                 const browserResult = await this.browserManager.getPage(url, waitFor, browserOptions);
                 browserUsed = true;
@@ -459,6 +465,7 @@ export class AgentCrawl {
             pdf: config.pdf,
             // Pass scrape-level hooks (onFetched, onResult) but not crawl-specific ones
             hooks: crawlHooks ? { onFetched: crawlHooks.onFetched, onResult: crawlHooks.onResult } : undefined,
+            scroll: config.scroll,
         };
 
         // Reject excessively long start URLs before any processing

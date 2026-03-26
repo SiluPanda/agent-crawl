@@ -26,6 +26,9 @@ Scrape options:
   --extract-css <json>     CSS extraction schema (JSON string)
   --extract-regex <json>   Regex extraction patterns (JSON string)
   --chunking               Enable token-aware chunking
+  --scroll                 Auto-scroll to load lazy/infinite content
+  --max-scrolls <n>        Max scroll iterations (default: 10)
+  --scroll-delay <ms>      Delay between scrolls in ms (default: 500)
 
 Crawl options (in addition to scrape options):
   -d, --depth <n>          Max crawl depth (default: 1)
@@ -101,6 +104,9 @@ async function main() {
                 'extract-css': { type: 'string' },
                 'extract-regex': { type: 'string' },
                 chunking: { type: 'boolean', default: false },
+                scroll: { type: 'boolean', default: false },
+                'max-scrolls': { type: 'string' },
+                'scroll-delay': { type: 'string' },
                 // Crawl-specific
                 depth: { type: 'string', short: 'd' },
                 pages: { type: 'string', short: 'n' },
@@ -155,6 +161,13 @@ async function main() {
     if (v.header && (v.header as string[]).length > 0) config.headers = parseHeaders(v.header as string[]);
     if (v.cookie && (v.cookie as string[]).length > 0) config.cookies = parseCookies(v.cookie as string[]);
     if (v.chunking) config.chunking = true;
+    if (v.scroll) {
+        config.scroll = {
+            enabled: true,
+            ...(v['max-scrolls'] ? { maxScrolls: parseInt(v['max-scrolls'] as string, 10) } : {}),
+            ...(v['scroll-delay'] ? { scrollDelay: parseInt(v['scroll-delay'] as string, 10) } : {}),
+        };
+    }
 
     if (v['extract-css']) {
         try {

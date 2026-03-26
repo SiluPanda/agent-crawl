@@ -101,6 +101,14 @@ export interface CrawlHooks extends ScrapeHooks {
     onPageCrawled?: (page: ScrapedPage, depth: number) => void | Promise<void>;
 }
 
+/** Configuration for auto-scrolling to trigger lazy/infinite content loading. */
+export interface ScrollConfig {
+    enabled?: boolean;
+    maxScrolls?: number; // max scroll iterations (default: 10)
+    scrollDelay?: number; // ms between scrolls (default: 500)
+    selector?: string; // scroll within a specific container (default: window)
+}
+
 export interface ScrapeConfig {
     mode?: 'static' | 'hybrid' | 'browser';
     waitFor?: string; // CSS selector to wait for (browser mode only)
@@ -120,6 +128,7 @@ export interface ScrapeConfig {
     screenshot?: boolean; // capture full-page screenshot as base64 PNG (forces browser mode)
     pdf?: boolean; // capture page as base64 PDF (forces browser mode)
     hooks?: ScrapeHooks; // lifecycle hooks for customization
+    scroll?: boolean | ScrollConfig; // auto-scroll for lazy/infinite content (forces browser mode)
 }
 
 export interface Citation {

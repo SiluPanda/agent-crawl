@@ -209,5 +209,5 @@ agent-crawl is a focused, security-hardened TypeScript library optimized for AI 
 6. ~~**DFS + priority crawling strategies** -- better crawl efficiency~~ **DONE in v3.5.0**
 7. ~~**Hooks/plugin system** -- extensibility for custom use cases~~ **DONE in v3.6.0**
 8. ~~**CLI tool** -- developer ergonomics~~ **DONE in v3.7.0**
-9. **Infinite scroll / lazy load handling** -- modern SPA support
+9. ~~**Infinite scroll / lazy load handling** -- modern SPA support~~ **DONE in v3.8.0**
 10. **MCP server** -- direct integration with AI coding tools

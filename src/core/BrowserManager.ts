@@ -1,5 +1,5 @@
 import { chromium, Browser, BrowserContext, BrowserContextOptions, Page, Route } from 'playwright-core';
-import { StealthLevel, ProxyConfig, CookieDef } from '../types.js';
+import { StealthLevel, ProxyConfig, CookieDef, ScrollConfig } from '../types.js';
 import { isPrivateHost, sanitizeUrlForLog } from './UrlUtils.js';
 
 export interface BrowserPageResult {
@@ -20,6 +20,7 @@ export interface BrowserPageOptions {
     jsCode?: string[];
     screenshot?: boolean;
     pdf?: boolean;
+    scroll?: ScrollConfig;
 }
 
 /**
@@ -288,7 +289,12 @@ export class BrowserManager {
                 await page.waitForSelector(safeSelector, { timeout: 10000 });
             }
 
-            // Execute user-provided JavaScript after page load + waitFor
+            // Auto-scroll for lazy/infinite content loading
+            if (options.scroll?.enabled !== false && options.scroll) {
+                await this.autoScroll(page, options.scroll);
+            }
+
+            // Execute user-provided JavaScript after page load + waitFor + scroll
             if (options.jsCode?.length) {
                 for (const script of options.jsCode) {
                     await page.evaluate(script).catch((err: Error) => {
@@ -549,6 +555,54 @@ export class BrowserManager {
         })();
 
         return this.closing;
+    }
+
+    /**
+     * Auto-scroll the page to trigger lazy-loading content.
+     * Stops early if no new content loads between scroll iterations.
+     */
+    private async autoScroll(page: Page, cfg: ScrollConfig): Promise<void> {
+        const maxScrolls = Math.min(Math.max(1, cfg.maxScrolls ?? 10), 100);
+        const delay = Math.min(Math.max(100, cfg.scrollDelay ?? 500), 10_000);
+        const selector = cfg.selector?.slice(0, 500);
+
+        try {
+            for (let i = 0; i < maxScrolls; i++) {
+                const previousHeight = await page.evaluate((sel) => {
+                    if (sel) {
+                        const el = document.querySelector(sel);
+                        return el ? el.scrollHeight : 0;
+                    }
+                    return document.body.scrollHeight;
+                }, selector ?? null);
+
+                await page.evaluate((sel) => {
+                    if (sel) {
+                        const el = document.querySelector(sel);
+                        if (el) el.scrollTop = el.scrollHeight;
+                    } else {
+                        window.scrollTo(0, document.body.scrollHeight);
+                    }
+                }, selector ?? null);
+
+                await page.waitForTimeout(delay);
+                // Brief network settle for lazy-loaded resources
+                await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
+
+                const newHeight = await page.evaluate((sel) => {
+                    if (sel) {
+                        const el = document.querySelector(sel);
+                        return el ? el.scrollHeight : 0;
+                    }
+                    return document.body.scrollHeight;
+                }, selector ?? null);
+
+                // No new content loaded — stop early
+                if (newHeight <= previousHeight) break;
+            }
+        } catch {
+            // Scroll errors are non-fatal
+        }
     }
 
     /**
