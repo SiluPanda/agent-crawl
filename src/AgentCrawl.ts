@@ -331,10 +331,56 @@ export class AgentCrawl {
 
         // 3. Extract all content in a single pass (optimized - parses HTML only once)
         // This extracts title, links, and converts to markdown efficiently
-        const extracted = this.markdownifier.extractAll(html, finalUrl, {
+        let extracted = this.markdownifier.extractAll(html, finalUrl, {
             extractMainContent,
             optimizeTokens,
         });
+
+        // 3b. Hybrid quality gate: if static fetch produced very little markdown
+        // but the raw HTML was substantial, the real content is likely JS-rendered.
+        // Retry with browser before returning a near-empty result.
+        const HYBRID_MIN_CONTENT_LENGTH = 100;
+        const HYBRID_HTML_RATIO_THRESHOLD = 0.01; // markdown < 1% of HTML → suspicious
+        if (
+            mode === 'hybrid' &&
+            !browserUsed &&
+            html.length > 2000 &&
+            (extracted.markdown.trim().length < HYBRID_MIN_CONTENT_LENGTH ||
+             extracted.markdown.trim().length / html.length < HYBRID_HTML_RATIO_THRESHOLD)
+        ) {
+            console.error(`Hybrid quality gate: markdown too short (${extracted.markdown.trim().length} chars from ${html.length} HTML bytes), retrying with browser for ${sanitizeUrlForLog(url)}...`);
+            try {
+                const browserOptions: BrowserPageOptions = {
+                    stealth,
+                    stealthLevel,
+                    proxy,
+                    headers: customHeaders,
+                    cookies,
+                    jsCode,
+                    screenshot,
+                    pdf,
+                    scroll,
+                };
+                const browserResult = await this.browserManager.getPage(url, waitFor, browserOptions);
+                browserUsed = true;
+                html = browserResult.html;
+                status = browserResult.status;
+                headers = browserResult.headers;
+                finalUrl = browserResult.finalUrl ?? finalUrl;
+                screenshotB64 = browserResult.screenshot;
+                pdfB64 = browserResult.pdf;
+
+                if (status >= 200 && status < 300) {
+                    extracted = this.markdownifier.extractAll(html, finalUrl, {
+                        extractMainContent,
+                        optimizeTokens,
+                    });
+                }
+            } catch (e: any) {
+                // Browser fallback failed — keep the static result rather than erroring
+                console.warn(`Hybrid browser retry failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`);
+            }
+        }
 
         // Run structured data extraction if configured
         let extractedData: Record<string, unknown> | undefined;
@@ -437,6 +483,35 @@ export class AgentCrawl {
     }
 
     static async crawl(startUrl: string, config: CrawlConfig = {}): Promise<CrawlResult> {
+        const pages: ScrapedPage[] = [];
+        const errors: Array<{ url: string; error: string }> = [];
+        let maxDepthReached = 0;
+
+        for await (const event of this._crawlCore(startUrl, config)) {
+            if (event.page) {
+                pages.push(event.page);
+                maxDepthReached = Math.max(maxDepthReached, event.depth);
+            }
+            if (event.error) {
+                errors.push(event.error);
+            }
+        }
+
+        return { pages, totalPages: pages.length, maxDepthReached, errors };
+    }
+
+    /**
+     * Stream crawl results as an async iterator.
+     * Yields ScrapedPage objects as each page is crawled.
+     * Enables real-time processing of large crawls without waiting for completion.
+     */
+    static async *crawlStream(startUrl: string, config: CrawlConfig = {}): AsyncGenerator<ScrapedPage> {
+        for await (const event of this._crawlCore(startUrl, config)) {
+            if (event.page) yield event.page;
+        }
+    }
+
+    private static async *_crawlCore(startUrl: string, config: CrawlConfig = {}): AsyncGenerator<{ page?: ScrapedPage; depth: number; error?: { url: string; error: string } }> {
         const maxDepth = Math.min(Math.max(0, this.finiteOr(config.maxDepth, 1)), 100);
         const maxPages = Math.min(Math.max(1, this.finiteOr(config.maxPages, 10)), 100_000);
         const concurrency = Math.min(Math.max(1, this.finiteOr(config.concurrency, 2)), 50);
@@ -572,9 +647,10 @@ export class AgentCrawl {
 
         const visited = new Set<string>();
         const queued = new Set<string>();
-        const pages: ScrapedPage[] = [];
-        const errors: Array<{ url: string; error: string }> = [];
-        const maxErrors = maxPages * 2; // Cap errors to prevent unbounded growth
+        const yieldedPages: ScrapedPage[] = []; // for state persistence only
+        const yieldedErrors: Array<{ url: string; error: string }> = []; // for state persistence only
+        let pageCount = 0;
+        const maxErrors = maxPages * 2;
         let maxDepthReached = 0;
 
         const MAX_STATE_BYTES = 100 * 1024 * 1024; // 100MB cap for state file
@@ -623,7 +699,7 @@ export class AgentCrawl {
                     if (stateCfg.persistPages && Array.isArray(parsed.pages)) {
                         const MAX_RESTORED_LINKS_PER_PAGE = 1000; // Cap per-page link validation to prevent DoS
                         for (const p of parsed.pages) {
-                            if (pages.length >= maxPages) break;
+                            if (yieldedPages.length >= maxPages) break;
                             if (
                                 p && typeof p === 'object' && !Array.isArray(p) &&
                                 typeof p.url === 'string' && p.url.length <= MAX_QUEUED_URL_LENGTH &&
@@ -645,16 +721,19 @@ export class AgentCrawl {
                                     const pageOrigin = new URL(p.url).origin;
                                     if (pageOrigin !== baseOrigin) continue;
                                 } catch { continue; }
-                                pages.push(p as ScrapedPage);
+                                const restoredPage = p as ScrapedPage;
+                                yieldedPages.push(restoredPage);
+                                pageCount++;
+                                yield { page: restoredPage, depth: 0 };
                             }
                         }
                     }
                     if (Array.isArray(parsed.errors)) {
                         for (const e of parsed.errors) {
-                            if (errors.length >= maxErrors) break;
+                            if (yieldedErrors.length >= maxErrors) break;
                             if (e && typeof e.url === 'string' && e.url.length <= MAX_QUEUED_URL_LENGTH
                                 && typeof e.error === 'string' && e.error.length <= 1000) {
-                                errors.push(e);
+                                yieldedErrors.push(e);
                             }
                         }
                     }
@@ -686,7 +765,8 @@ export class AgentCrawl {
             }
         } else if (!visited.has(normalizedStartUrl)) {
             // Start URL failed pattern/robots filters — report so the caller knows
-            errors.push({ url: normalizedStartUrl, error: 'Start URL excluded by includePatterns, excludePatterns, or robots.txt' });
+            yieldedErrors.push({ url: normalizedStartUrl, error: 'Start URL excluded by includePatterns, excludePatterns, or robots.txt' });
+            yield { depth: 0, error: { url: normalizedStartUrl, error: 'Start URL excluded by includePatterns, excludePatterns, or robots.txt' } };
         }
         queued.add(normalizedStartUrl);
 
@@ -728,8 +808,8 @@ export class AgentCrawl {
                     queue: crawlQueue.toArray(),
                     visited: Array.from(visited),
                     queued: Array.from(queued),
-                    pages: stateCfg.persistPages ? pages : [],
-                    errors,
+                    pages: stateCfg.persistPages ? yieldedPages : [],
+                    errors: yieldedErrors,
                     maxDepthReached,
                     updatedAt: Date.now(),
                 };
@@ -755,10 +835,10 @@ export class AgentCrawl {
         };
 
         let batches = 0;
-        while (crawlQueue.length > 0 && pages.length < maxPages) {
+        while (crawlQueue.length > 0 && pageCount < maxPages) {
             // Take a batch of URLs up to concurrency limit
             const batch: Array<{ url: string; depth: number }> = [];
-            while (batch.length < concurrency && crawlQueue.length > 0 && (pages.length + batch.length) < maxPages) {
+            while (batch.length < concurrency && crawlQueue.length > 0 && (pageCount + batch.length) < maxPages) {
                 const item = crawlQueue.shift()!;
                 queued.delete(item.url);
 
@@ -804,9 +884,11 @@ export class AgentCrawl {
 
                     // Successful scrape if no explicit metadata error
                     if (!page.metadata?.error) {
-                        if (pages.length >= maxPages) continue;
-                        pages.push(page);
+                        if (pageCount >= maxPages) continue;
+                        pageCount++;
+                        yieldedPages.push(page);
                         maxDepthReached = Math.max(maxDepthReached, depth);
+                        yield { page, depth };
 
                         // Hook: onPageCrawled — notify after each successful page
                         if (crawlHooks?.onPageCrawled) {
@@ -835,15 +917,19 @@ export class AgentCrawl {
                             }
                         }
                     } else {
-                        if (errors.length < maxErrors) {
+                        if (yieldedErrors.length < maxErrors) {
                             const errMsg = page.metadata?.error || 'Unknown error';
-                            errors.push({ url, error: typeof errMsg === 'string' && errMsg.length > this.MAX_ERROR_LENGTH ? errMsg.slice(0, this.MAX_ERROR_LENGTH) + '...' : String(errMsg) });
+                            const err = { url, error: typeof errMsg === 'string' && errMsg.length > this.MAX_ERROR_LENGTH ? errMsg.slice(0, this.MAX_ERROR_LENGTH) + '...' : String(errMsg) };
+                            yieldedErrors.push(err);
+                            yield { depth, error: err };
                         }
                     }
                 } else {
-                    if (errors.length < maxErrors) {
+                    if (yieldedErrors.length < maxErrors) {
                         const rawMsg = result.reason?.message || 'Failed to scrape';
-                        errors.push({ url, error: rawMsg.length > this.MAX_ERROR_LENGTH ? rawMsg.slice(0, this.MAX_ERROR_LENGTH) + '...' : rawMsg });
+                        const err = { url, error: rawMsg.length > this.MAX_ERROR_LENGTH ? rawMsg.slice(0, this.MAX_ERROR_LENGTH) + '...' : rawMsg };
+                        yieldedErrors.push(err);
+                        yield { depth, error: err };
                     }
                 }
             }
@@ -858,13 +944,7 @@ export class AgentCrawl {
         if (stateEnabled) {
             await persistState().catch(() => {});
         }
-
-        return {
-            pages,
-            totalPages: pages.length,
-            maxDepthReached,
-            errors,
-        };
+        // Generator completes — all pages and errors were yielded
     }
 
     /**

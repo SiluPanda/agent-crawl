@@ -280,6 +280,11 @@ export class BrowserManager {
                 throw new Error(`Navigation resulted in invalid URL: ${sanitizeUrlForLog(finalUrl)}`);
             }
 
+            // Wait for network to settle so SPA frameworks can fetch data and render.
+            // domcontentloaded fires before async fetches complete; networkidle
+            // catches the subsequent API calls that populate the page.
+            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+
             // Try to dismiss cookie consent banners
             await this.dismissCookieBanners(page);
 

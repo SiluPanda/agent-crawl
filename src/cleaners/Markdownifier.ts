@@ -222,9 +222,19 @@ export class Markdownifier {
         $('[aria-hidden="true"]').remove();
         $('[class*="hidden"]').each((_, el) => {
             const className = $(el).attr('class') || '';
-            if (/\b(hidden|visually-hidden)\b/i.test(className)) {
-                $(el).remove();
+            // Match "hidden" or "visually-hidden" as standalone CSS class tokens.
+            // Must NOT match "overflow-hidden", "text-hidden-*", etc. where "hidden"
+            // is part of a hyphenated compound, nor Tailwind responsive patterns like
+            // "hidden lg:flex" which are visible at larger breakpoints.
+            const classes = className.split(/\s+/);
+            const isStandaloneHidden = classes.includes('hidden');
+            const isVisuallyHidden = classes.includes('visually-hidden');
+            if (!isStandaloneHidden && !isVisuallyHidden) return;
+            // Skip Tailwind responsive hidden: "hidden lg:flex", "hidden md:block", etc.
+            if (isStandaloneHidden && /\b(sm|md|lg|xl|2xl):(flex|block|grid|inline|table|contents)\b/.test(className)) {
+                return;
             }
+            $(el).remove();
         });
 
         // Remove images with srcset (complex responsive images)
@@ -461,10 +471,19 @@ export class Markdownifier {
         $('[aria-hidden="true"]').remove();
         $('[class*="hidden"]').each((_, el) => {
             const className = $(el).attr('class') || '';
-            // Only remove if it's a visibility class, not "hidden-feature" etc
-            if (/\b(hidden|visually-hidden)\b/i.test(className)) {
-                $(el).remove();
+            // Match "hidden" or "visually-hidden" as standalone CSS class tokens.
+            // Must NOT match "overflow-hidden", "text-hidden-*", etc. where "hidden"
+            // is part of a hyphenated compound, nor Tailwind responsive patterns like
+            // "hidden lg:flex" which are visible at larger breakpoints.
+            const classes = className.split(/\s+/);
+            const isStandaloneHidden = classes.includes('hidden');
+            const isVisuallyHidden = classes.includes('visually-hidden');
+            if (!isStandaloneHidden && !isVisuallyHidden) return;
+            // Skip Tailwind responsive hidden: "hidden lg:flex", "hidden md:block", etc.
+            if (isStandaloneHidden && /\b(sm|md|lg|xl|2xl):(flex|block|grid|inline|table|contents)\b/.test(className)) {
+                return;
             }
+            $(el).remove();
         });
 
         // Remove images with srcset (complex responsive images)
