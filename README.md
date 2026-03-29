@@ -25,6 +25,73 @@ npm install agent-crawl
 bun add agent-crawl
 ```
 
+## CLI
+
+AgentCrawl ships with a CLI for quick scraping and crawling from the terminal.
+
+```bash
+# Install globally
+npm install -g agent-crawl
+
+# Or use directly with npx
+npx agent-crawl scrape https://example.com
+```
+
+### Scrape a page to markdown
+
+```bash
+agent-crawl scrape https://example.com
+```
+
+### JSON output with metadata
+
+```bash
+agent-crawl scrape https://example.com --output json
+```
+
+### Browser mode for JS-rendered pages
+
+```bash
+agent-crawl scrape https://example.com --mode browser --stealth
+agent-crawl scrape https://example.com --mode browser --wait-for ".content" --js "document.querySelector('.more').click()"
+```
+
+### Structured extraction
+
+```bash
+agent-crawl scrape https://example.com --output json --extract-css '{"title":"h1","price":".price"}'
+agent-crawl scrape https://example.com --output json --extract-regex '{"email":"[\\w.+-]+@[\\w-]+\\.[\\w.]+"}'
+```
+
+### Crawl multiple pages
+
+```bash
+agent-crawl crawl https://example.com --depth 2 --pages 50 --strategy dfs
+agent-crawl crawl https://example.com --robots --sitemap --include "/blog/*"
+agent-crawl crawl https://example.com --strategy bestfirst --keywords "pricing,plans,features"
+```
+
+### More options
+
+```bash
+# Auto-scroll for infinite/lazy content
+agent-crawl scrape https://example.com --mode browser --scroll --max-scrolls 20
+
+# Screenshot and PDF capture
+agent-crawl scrape https://example.com --mode browser --screenshot --pdf
+
+# Custom headers and cookies
+agent-crawl scrape https://example.com -H "Authorization: Bearer tok123" --cookie "session=abc"
+
+# Table extraction and footnote-style citations
+agent-crawl scrape https://example.com --tables --citations
+
+# Pipe to an LLM
+agent-crawl scrape https://docs.example.com | llm "summarize this page"
+```
+
+Run `agent-crawl --help` for the full list of options.
+
 ## Quick Start
 
 ### Basic Usage
