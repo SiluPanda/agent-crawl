@@ -1,6 +1,6 @@
 {
   "name": "agent-crawl",
-  "version": "3.14.0",
+  "version": "3.14.1",
   "description": "High-performance, lightweight TypeScript web scraping library for LLM Agents.",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
