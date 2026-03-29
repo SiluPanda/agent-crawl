@@ -1,5 +1,7 @@
 # AgentCrawl
 
+[![npm downloads](https://img.shields.io/npm/dt/agent-crawl.svg)](https://www.npmjs.com/package/agent-crawl)
+
 **The High-Performance TypeScript Web Scraper for LLM Agents.**
 
 AgentCrawl is built to be the "eyes" of your AI Agents. It fetches web content, strips away the noise (ads, scripts, styles), and returns clean, token-optimized Markdown ready for your LLM context window.
